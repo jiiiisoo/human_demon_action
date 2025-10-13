@@ -1,0 +1,2 @@
+{"id": "sample_1", "image": "/path/to/image.jpg", "instruction": "pick up the cup"}
+{"id": "sample_2", "image": ["/path/to/img1.jpg", "/path/to/img2.jpg"], "instruction": "move the object"}

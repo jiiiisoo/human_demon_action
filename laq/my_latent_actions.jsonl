@@ -1,0 +1,1 @@
+{"id": "test_1", "instruction": "pick up the object", "latent_codes": [1, 0, 6, 6], "reconstructed_image_shape": [3, 256, 256], "saved_images": ["/workspace/LAPA/laq/test_sample_images/test_1_reconstructed.png"]}
