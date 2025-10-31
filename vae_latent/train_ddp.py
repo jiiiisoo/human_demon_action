@@ -18,7 +18,8 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 
 from vanilla_vae_model import VanillaVAE
-from dataset_sthv2 import SthV2FrameDataset
+# from data.dataset_sthv2 import SthV2FrameDataset
+from data.dataset_droid import DroidFrameDataset
 
 
 def setup_ddp(rank, world_size):
@@ -247,18 +248,16 @@ def train(rank, world_size, config, resume_from=None):
         writer = None
     
     # Create datasets
-    train_dataset = SthV2FrameDataset(
+    train_dataset = DroidFrameDataset(
         config['data_params']['data_path'],
         image_size=config['data_params']['image_size'],
-        split='train',
-        val_split=0.05
+        train=True,
     )
     
-    val_dataset = SthV2FrameDataset(
+    val_dataset = DroidFrameDataset(
         config['data_params']['data_path'],
         image_size=config['data_params']['image_size'],
-        split='val',
-        val_split=0.05
+        train=False,
     )
     
     # Create samplers for DDP

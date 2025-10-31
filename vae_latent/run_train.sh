@@ -4,7 +4,7 @@
 # Adjust parameters as needed
 
 # Default parameters
-CONFIG="config_vae_sthv2.yaml"
+CONFIG="config_vae_droid.yaml"
 MODE="multi"  # "multi" or "single"
 RESUME=""
 

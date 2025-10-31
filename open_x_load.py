@@ -8,6 +8,8 @@ def dataset2path(dataset_name):
     version = '1.0.0'
   elif dataset_name == 'language_table':
     version = '0.0.1'
+  elif dataset_name == 'droid':
+    version = '1.0.0'
   else:
     version = '0.1.0'
   return f'gs://gresearch/robotics/{dataset_name}/{version}'
@@ -20,17 +22,17 @@ def as_gif(images, path='temp.gif'):
   return gif_bytes
 
 if __name__ == "__main__" :
-    dataset = "bridge"
+    dataset = "droid"
     builder = tfds.builder_from_directory(builder_dir=dataset2path(dataset))
     print(builder.info.features)
-    display_key = 'image'
+    display_key = 'exterior_image_1_left'
     if display_key not in builder.info.features['steps']['observation']:
         raise ValueError(
             f"The key {display_key} was not found in this dataset.\n"
             + "Please choose a different image key to display for this dataset.\n"
             + "Here is the observation spec:\n"
             + str(builder.info.features['steps']['observation']))
-    ds = builder.as_dataset(split='train[:10]').shuffle(10)
+    ds = builder.as_dataset(split='train')
     episode = next(iter(ds))
     images = [step['observation'][display_key] for step in episode['steps']]
     images = [Image.fromarray(image.numpy()) for image in images]

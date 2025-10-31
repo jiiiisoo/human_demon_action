@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 
 from vanilla_vae_model import VanillaVAE
-from dataset_sthv2 import get_dataloaders
+from data.dataset_droid import get_dataloaders
 
 
 def load_config(config_path):
@@ -189,8 +189,8 @@ def validate(model, val_loader, epoch, config, writer, global_step, log_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Vanilla VAE on SthV2 (Single GPU)')
-    parser.add_argument('--config', type=str, default='config_vae_sthv2.yaml', help='Path to config file')
+    parser = argparse.ArgumentParser(description='Train Vanilla VAE on Droid (Single GPU)')
+    parser.add_argument('--config', type=str, default='config_vae_droid.yaml', help='Path to config file')
     parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     args = parser.parse_args()
     

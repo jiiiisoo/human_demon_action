@@ -1,0 +1,41 @@
+model_params:
+  name: 'VanillaVAE'
+  in_channels: 3
+  # Match LAQ dimensions for fair comparison
+  # LAQ uses dim=1024, which is the feature dimension
+  # For VAE, we use hidden_dims to match the capacity
+  hidden_dims: [64, 128, 256, 512, 1024]  # Final dim matches LAQ's 1024
+  latent_dim: 256  # Latent dimension
+
+data_params:
+  data_path: "gs://gresearch/robotics/droid/1.0.0"
+  image_size: 256  # Match LAQ's image_size
+  train_batch_size: 64  # Per GPU batch size
+  val_batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+exp_params:
+  # Match LAQ training params
+  LR: 1.0e-4  # Match LAQ's learning rate
+  weight_decay: 0.0
+  scheduler_gamma: 0.95
+  kld_weight: 0.0001  # KLD weight for VAE loss
+  manual_seed: 1265
+  max_grad_norm: 1.0  # Gradient clipping
+
+trainer_params:
+  gpus: -1  # Use all available GPUs
+  max_epochs: 20000000
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+
+logging_params:
+  save_dir: "logs_vae"
+  name: "VanillaVAE_droid"
+  save_every_n_steps: 5000
+  val_every_n_steps: 5000
+  log_images_every_n_steps: 5000
+
