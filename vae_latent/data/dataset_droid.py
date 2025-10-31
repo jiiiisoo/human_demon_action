@@ -32,12 +32,16 @@ class DroidFrameDataset(Dataset):
         data_path: str,
         image_size: Union[int, Tuple[int, int]] = 256,
         train: bool = True,
-        image_key: str = 'exterior_image_1_left'
+        image_key: str = 'exterior_image_1_left',
+        rank: int = 0,
+        world_size: int = 1
     ):
         super().__init__()
         self.data_path = data_path
         self.train = train
         self.image_key = image_key
+        self.rank = rank
+        self.world_size = max(1, world_size)
         
         # Load TFDS builder
         builder = tfds.builder_from_directory(builder_dir=data_path)
@@ -54,13 +58,15 @@ class DroidFrameDataset(Dataset):
         # Load dataset
         ds = builder.as_dataset(split=tfds_split)
         
-        # Collect all frames from all episodes
+        # Collect frames only from this rank's shard of episodes to avoid
+        # each GPU loading the entire split.
         split_name = "train" if train else "val"
         self.frames = []
-        for episode in tqdm(ds, desc=f"Loading {split_name} split"):
+        for epi_idx, episode in enumerate(tqdm(ds, desc=f"Loading {split_name} split (rank {self.rank}/{self.world_size})")):
+            if (epi_idx % self.world_size) != self.rank:
+                continue
             steps = episode['steps']
             for step in steps:
-                # Store the image tensor directly
                 self.frames.append(step['observation'][self.image_key])
         
         print(f"Loaded {len(self.frames)} frames for {split_name} split")

@@ -252,12 +252,16 @@ def train(rank, world_size, config, resume_from=None):
         config['data_params']['data_path'],
         image_size=config['data_params']['image_size'],
         train=True,
+        rank=rank,
+        world_size=world_size,
     )
     
     val_dataset = DroidFrameDataset(
         config['data_params']['data_path'],
         image_size=config['data_params']['image_size'],
         train=False,
+        rank=rank,
+        world_size=world_size,
     )
     
     # Create samplers for DDP
