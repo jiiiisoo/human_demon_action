@@ -11,3 +11,4 @@
 *.mkv
 *.log
 *.csv
+vae_latent/logs_vae/
