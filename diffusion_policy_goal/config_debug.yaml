@@ -1,0 +1,40 @@
+# Debug Configuration (smaller dataset for quick testing)
+
+data:
+  data_path: "/mnt/data/droid/droid_local"
+  image_size: 256
+  num_workers: 4
+  debug_max_episodes: 50  # Use only 50 episodes for debugging
+
+model:
+  vae_checkpoint_path: "/home/jisookim/human_demon_action/vae_latent/logs_vae/VanillaVAE_droid/checkpoints/vae_epoch_80.pt"
+  latent_dim: 64
+  num_kp: 32  # SpatialSoftmax keypoints
+  obs_feature_dim: 64  # Final feature dimension
+  action_dim: 7
+  obs_horizon: 1  # Single observation frame
+  action_horizon: 16
+  diffusion_step_embed_dim: 256
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+
+diffusion:
+  num_train_timesteps: 100
+  num_inference_timesteps: 20
+  beta_schedule: 'squaredcos_cap_v2'
+  clip_sample: true
+  set_alpha_to_one: true
+  steps_offset: 0
+  prediction_type: 'epsilon'
+
+training:
+  output_dir: "/home/jisookim/human_demon_action/diffusion_policy_goal/outputs_debug"
+  num_epochs: 20
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-6
+  use_ema: true
+  ema_power: 0.75
+  save_every: 5
+

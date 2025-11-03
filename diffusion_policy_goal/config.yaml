@@ -1,0 +1,51 @@
+# Goal-Conditioned Diffusion Policy Configuration
+
+data:
+  data_path: "/mnt/data/droid/droid_local"
+  image_size: 256  # Resize images to 128x128 (as in UniSkill paper)
+  num_workers: 4
+  debug_max_episodes: null  # Set to a number for debugging
+
+model:
+  # VAE encoder (for goal images)
+  vae_checkpoint_path: "/home/jisookim/human_demon_action/vae_latent/logs_vae/VanillaVAE_droid/checkpoints/vae_epoch_80.pt"
+  latent_dim: 64  # VAE latent dimension
+  
+  # ResNet encoder (for observation images) - robomimic VisualCore style
+  num_kp: 32  # SpatialSoftmax keypoints
+  obs_feature_dim: 64  # Final feature dimension after linear projection
+  
+  # Diffusion model
+  action_dim: 7  # DROID action dimension (6 DoF + gripper)
+  obs_horizon: 1  # Single observation frame (current state)
+  action_horizon: 16  # Number of actions to predict
+  
+  # UNet architecture
+  diffusion_step_embed_dim: 256
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+
+diffusion:
+  # DDIM scheduler (as in UniSkill paper)
+  num_train_timesteps: 100
+  num_inference_timesteps: 20  # 20 denoising steps as in UniSkill
+  beta_schedule: 'squaredcos_cap_v2'
+  clip_sample: true
+  set_alpha_to_one: true
+  steps_offset: 0
+  prediction_type: 'epsilon'
+
+training:
+  output_dir: "/home/jisookim/human_demon_action/diffusion_policy_goal/outputs"
+  num_epochs: 100000
+  batch_size: 128
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-2
+  
+  # EMA
+  use_ema: true
+  ema_power: 0.75
+  
+  # Checkpointing
+  save_every: 1
