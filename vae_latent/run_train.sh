@@ -45,6 +45,9 @@ echo ""
 # Run training based on mode
 if [ "$MODE" == "multi" ]; then
     echo "Starting multi-GPU training..."
+    # Set environment variables to suppress TensorFlow warnings
+    export TF_CPP_MIN_LOG_LEVEL=3
+    export TF_ENABLE_ONEDNN_OPTS=0
     if [ -n "$RESUME" ]; then
         python train_ddp.py --config "$CONFIG" --resume "$RESUME"
     else

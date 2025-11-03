@@ -4,18 +4,41 @@ Compatible with PyTorch DataLoader and DDP training.
 Based on uniskill BaseDataset structure but adapted for VAE single-frame training.
 """
 import os
+import sys
+
+# CRITICAL: Set environment variables BEFORE any imports
+# Suppress TensorFlow logging only (don't hide GPUs - PyTorch needs them!)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import random
 from pathlib import Path
 from typing import Union, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+# Suppress stderr during TensorFlow import
+import io
+_stderr = sys.stderr
+sys.stderr = io.StringIO()
+
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+    tf.get_logger().setLevel('ERROR')
+    import tensorflow_datasets as tfds
+finally:
+    sys.stderr = _stderr
 
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms as T
 import numpy as np
-import tensorflow_datasets as tfds
 from tqdm import tqdm
 
+def ensure_rgb(img):
+    return img.convert('RGB') if img.mode != 'RGB' else img
 
 class DroidFrameDataset(Dataset):
     """
@@ -34,7 +57,8 @@ class DroidFrameDataset(Dataset):
         train: bool = True,
         image_key: str = 'exterior_image_1_left',
         rank: int = 0,
-        world_size: int = 1
+        world_size: int = 1,
+        debug_max_episodes: int = None  # Set to limit episodes for debugging
     ):
         super().__init__()
         self.data_path = data_path
@@ -58,6 +82,12 @@ class DroidFrameDataset(Dataset):
         # Load dataset
         ds = builder.as_dataset(split=tfds_split)
         
+        # Debug mode: limit episodes for quick testing
+        if debug_max_episodes is not None and debug_max_episodes > 0:
+            ds = ds.take(debug_max_episodes)
+            if self.rank == 0:
+                print(f"[DEBUG] Loading only {debug_max_episodes} episodes for testing")
+        
         # Collect frames only from this rank's shard of episodes to avoid
         # each GPU loading the entire split.
         split_name = "train" if train else "val"
@@ -73,9 +103,11 @@ class DroidFrameDataset(Dataset):
         
         # Image transforms (similar to uniskill's image_transforms + fdm_normalize)
         # Normalize to [-1, 1] to match Tanh output
+        # Force square images by using tuple (H, W)
+        target_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         self.transform = T.Compose([
-            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-            T.Resize(image_size, interpolation=T.InterpolationMode.BILINEAR),
+            T.Lambda(ensure_rgb),
+            T.Resize(target_size, interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Scale to [-1, 1]
         ])

@@ -4,6 +4,10 @@ Supports DDP (DistributedDataParallel) for efficient multi-GPU training.
 """
 import os
 import sys
+
+# Note: TensorFlow environment variables removed since we're using local dataset
+# No TensorFlow dependencies anymore!
+
 import argparse
 from pathlib import Path
 import yaml
@@ -19,7 +23,9 @@ import torchvision.utils as vutils
 
 from vanilla_vae_model import VanillaVAE
 # from data.dataset_sthv2 import SthV2FrameDataset
-from data.dataset_droid import DroidFrameDataset
+# from data.dataset_droid import DroidFrameDataset  # Original: loads all frames to memory
+# from data.dataset_droid_lazy import DroidFrameDatasetCached as DroidFrameDataset  # TensorFlow-based lazy loading
+from data.dataset_droid_local import DroidFrameDatasetLocal as DroidFrameDataset  # Local file system, no TensorFlow!
 
 
 def setup_ddp(rank, world_size):
@@ -113,10 +119,6 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), config['exp_params']['max_grad_norm'])
         
         optimizer.step()
-        
-        # Update learning rate
-        if scheduler is not None:
-            scheduler.step()
         
         # Accumulate losses
         total_loss += loss.item()
@@ -248,12 +250,14 @@ def train(rank, world_size, config, resume_from=None):
         writer = None
     
     # Create datasets
+    debug_episodes = config['data_params'].get('debug_max_episodes', None)
     train_dataset = DroidFrameDataset(
         config['data_params']['data_path'],
         image_size=config['data_params']['image_size'],
         train=True,
         rank=rank,
         world_size=world_size,
+        debug_max_episodes=debug_episodes,
     )
     
     val_dataset = DroidFrameDataset(
@@ -262,6 +266,7 @@ def train(rank, world_size, config, resume_from=None):
         train=False,
         rank=rank,
         world_size=world_size,
+        debug_max_episodes=debug_episodes,
     )
     
     # Create samplers for DDP
@@ -297,6 +302,19 @@ def train(rank, world_size, config, resume_from=None):
         pin_memory=config['data_params']['pin_memory'],
         drop_last=False
     )
+    
+    # Safety check: ensure dataloaders have data
+    if len(train_loader) == 0:
+        if rank == 0:
+            print(f"ERROR: Training dataloader is empty on rank {rank}!")
+            print(f"Train dataset size: {len(train_dataset)}")
+            print(f"Batch size: {config['data_params']['train_batch_size']}")
+        cleanup_ddp()
+        return
+    
+    if rank == 0:
+        print(f"Train dataset: {len(train_dataset)} samples, {len(train_loader)} batches")
+        print(f"Val dataset: {len(val_dataset)} samples, {len(val_loader)} batches")
     
     # Create model
     model = VanillaVAE(**config['model_params'])
@@ -339,6 +357,12 @@ def train(rank, world_size, config, resume_from=None):
         
         if rank == 0:
             print(f"\nEpoch {epoch} - Train Loss: {avg_loss:.4f}, Recon: {avg_recon_loss:.4f}, KLD: {avg_kld_loss:.4f}")
+        
+        # Update learning rate scheduler (per epoch)
+        if scheduler is not None:
+            scheduler.step()
+            if rank == 0:
+                print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6e}")
         
         # Validate
         if (epoch + 1) % config['trainer_params']['check_val_every_n_epoch'] == 0:

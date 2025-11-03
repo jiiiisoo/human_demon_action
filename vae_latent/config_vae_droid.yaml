@@ -1,19 +1,24 @@
 model_params:
   name: 'VanillaVAE'
   in_channels: 3
-  # Match LAQ dimensions for fair comparison
-  # LAQ uses dim=1024, which is the feature dimension
-  # For VAE, we use hidden_dims to match the capacity
-  hidden_dims: [64, 128, 256, 512, 1024]  # Final dim matches LAQ's 1024
-  latent_dim: 256  # Latent dimension
+  #   # Match LAQ dimensions for fair comparison
+  # # LAQ uses dim=1024, which is the feature dimension
+  # # For VAE, we use hidden_dims to match the capacity
+  # hidden_dims: [64, 128, 256, 512, 1024]  # Final dim matches LAQ's 1024
+  # latent_dim: 256  # Latent dimension
+  # Match UniSkill's skill_dim=64 for fair comparison
+  # LAQ uses quant_dim=32, UniSkill uses skill_dim=64
+  hidden_dims: [64, 128, 256, 512, 1024]  # Feature extraction capacity
+  latent_dim: 64  # Latent dimension - matching UniSkill
 
 data_params:
-  data_path: "gs://gresearch/robotics/droid/1.0.0"
+  data_path: "/mnt/data/droid/droid_local"  # Local file system path (no TensorFlow!)
   image_size: 256  # Match LAQ's image_size
-  train_batch_size: 64  # Per GPU batch size
-  val_batch_size: 64
-  num_workers: 4
+  train_batch_size: 512  # Per GPU batch size
+  val_batch_size: 256
+  num_workers: 4  # Can now use multiple workers since no TensorFlow pickle issues!
   pin_memory: true
+  # debug_max_episodes: 50  # For debugging: use 50 episodes, set to null for full dataset
 
 exp_params:
   # Match LAQ training params
