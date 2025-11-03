@@ -16,3 +16,4 @@ vae_latent/logs_vae/
 *.err
 *.pt
 events.out.tfevents*
+*.pyc
