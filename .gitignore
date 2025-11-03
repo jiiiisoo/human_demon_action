@@ -12,3 +12,7 @@
 *.log
 *.csv
 vae_latent/logs_vae/
+*.out
+*.err
+*.pt
+events.out.tfevents*
