@@ -17,3 +17,5 @@ vae_latent/logs_vae/
 *.pt
 events.out.tfevents*
 *.pyc
+droid_policy_learning/logs/
+droid_policy_learning/log/
