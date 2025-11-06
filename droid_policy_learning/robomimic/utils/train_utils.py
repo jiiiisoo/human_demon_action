@@ -13,6 +13,7 @@ import imageio
 import numpy as np
 from copy import deepcopy
 from collections import OrderedDict
+import math
 
 import torch
 
@@ -610,8 +611,10 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
         model.set_eval()
     else:
         model.set_train()
+
     # if num_steps is None:
-    #     num_steps = len(data_loader)
+    #     num_steps = math.ceil(len(list(data_loader))/config.train.batch_size)
+    # print(f"num_steps: {num_steps}")
 
     step_log_all = []
     timing_stats = dict(Data_Loading=[], Process_Batch=[], Train_Batch=[], Log_Info=[])
@@ -628,6 +631,9 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
             t = time.time()
             batch = next(data_loader_iter)
         except StopIteration:
+            print('=' * 100)
+            print(f"[Data] Completed one full pass through dataset at epoch {epoch}, resetting iterator.")
+            print('=' * 100)
             # reset for next dataset pass
             data_loader_iter = iter(data_loader)
             t = time.time()
