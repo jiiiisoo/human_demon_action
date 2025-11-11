@@ -19,3 +19,7 @@ events.out.tfevents*
 *.pyc
 droid_policy_learning/logs/
 droid_policy_learning/log/
+LIBERO/
+vqvae_lapa/
+vae_uniskill/
+laq/
