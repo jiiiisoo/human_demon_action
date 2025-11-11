@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow_datasets as tfds
 from PIL import Image
-from IPython import display
+# from IPython import display
 
 def dataset2path(dataset_name):
   if dataset_name == 'robo_net':
@@ -33,6 +33,8 @@ if __name__ == "__main__" :
             + "Here is the observation spec:\n"
             + str(builder.info.features['steps']['observation']))
     ds = builder.as_dataset(split='train')
+    print(len(ds))
+    1/0
     episode = next(iter(ds))
     images = [step['observation'][display_key] for step in episode['steps']]
     images = [Image.fromarray(image.numpy()) for image in images]

@@ -4,10 +4,10 @@
 #SBATCH --error=slurm_logs/vae_train_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=128
 #SBATCH --gres=gpu:8
 #SBATCH --time=500:00:00
-#SBATCH --mem=200G
+#SBATCH --mem=1500G
 #SBATCH -q main
 
 # Print job info

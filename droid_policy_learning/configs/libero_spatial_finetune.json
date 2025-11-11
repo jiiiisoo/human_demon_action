@@ -1,0 +1,258 @@
+{
+    "algo_name": "diffusion_policy",
+    "experiment": {
+        "name": "libero_spatial_finetune_from_droid",
+        "validate": false,
+        "logging": {
+            "terminal_output_to_txt": true,
+            "log_tb": true,
+            "log_wandb": false,
+            "wandb_proj_name": "libero_finetune"
+        },
+        "mse": {
+            "enabled": true,
+            "every_n_epochs": 10,
+            "on_save_ckpt": true,
+            "num_samples": 1,
+            "visualize": true
+        },
+        "save": {
+            "enabled": true,
+            "every_n_seconds": null,
+            "every_n_epochs": 1,
+            "epochs": [],
+            "on_best_validation": false,
+            "on_best_rollout_return": false,
+            "on_best_rollout_success_rate": true
+        },
+        "epoch_every_n_steps": 50,
+        "validation_epoch_every_n_steps": 10,
+        "env": null,
+        "additional_envs": null,
+        "render": false,
+        "render_video": false,
+        "keep_all_videos": false,
+        "video_skip": 5,
+        "rollout": {
+            "enabled": false,
+            "n": 50,
+            "horizon": 400,
+            "rate": 50,
+            "warmstart": 0,
+            "terminate_on_success": true
+        },
+        "ckpt_path": "/home/jisookim/human_demon_action/droid_policy_learning/log/droid/im/diffusion_policy/11-05-None/bz_2048_noise_samples_8_sample_weights_1_dataset_names_droid_cams_2cams_goalcams_2cams_goal_mode_offset_truncated_geom_factor_0.3_ldkeys_proprio-lang_visenc_VisualCore_fuser_None/20251106125113/models/model_epoch_100.pth",
+        "strict_weight_loading": false,
+        "env_meta_update_dict": {}
+    },
+    "train": {
+        "data": [
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate_demo.hdf5"
+            },
+            {
+                "path": "/mnt/data/libero/libero_spatial_actions_6d/pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate_demo.hdf5"
+            }
+        ],
+        "output_dir": "/home/jisookim/human_demon_action/droid_policy_learning/log/libero/spatial/diffusion_policy",
+        "num_data_workers": 0,
+        "hdf5_cache_mode": "low_dim",
+        "hdf5_use_swmr": true,
+        "hdf5_load_next_obs": false,
+        "hdf5_normalize_obs": false,
+        "hdf5_filter_key": null,
+        "hdf5_validation_filter_key": null,
+        "seq_length": 15,
+        "pad_seq_length": true,
+        "frame_stack": 2,
+        "pad_frame_stack": true,
+        "dataset_keys": [
+            "actions"
+        ],
+        "goal_mode": "last",
+        "goal_offset": null,
+        "truncated_geom_factor": null,
+        "cuda": true,
+        "batch_size": 1024,
+        "num_epochs": 500,
+        "seed": 1,
+        "action_keys": [
+            "actions"
+        ],
+        "action_config": {
+            "actions": {
+                "normalization": "min_max"
+            }
+        },
+        "shuffled_obs_key_groups": []
+    },
+    "algo": {
+        "optim_params": {
+            "policy": {
+                "learning_rate": {
+                    "initial": 1e-05,
+                    "decay_factor": 0.1,
+                    "epoch_schedule": []
+                },
+                "regularization": {
+                    "L2": 0.0
+                }
+            }
+        },
+        "horizon": {
+            "observation_horizon": 2,
+            "action_horizon": 8,
+            "prediction_horizon": 16
+        },
+        "unet": {
+            "enabled": true,
+            "diffusion_step_embed_dim": 256,
+            "down_dims": [
+                256,
+                512,
+                1024
+            ],
+            "kernel_size": 5,
+            "n_groups": 8
+        },
+        "ema": {
+            "enabled": true,
+            "power": 0.75
+        },
+        "ddpm": {
+            "enabled": false,
+            "num_train_timesteps": 100,
+            "num_inference_timesteps": 100,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": true,
+            "prediction_type": "epsilon"
+        },
+        "ddim": {
+            "enabled": true,
+            "num_train_timesteps": 100,
+            "num_inference_timesteps": 10,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": true,
+            "set_alpha_to_one": true,
+            "steps_offset": 0,
+            "prediction_type": "epsilon"
+        },
+        "skill_conditioning": {
+            "enabled": true,
+            "goal_key": "agentview_rgb",
+            "latent_dim": 64,
+            "vae_checkpoint": "/home/jisookim/human_demon_action/vae_latent/logs_vae/VanillaVAE_droid/checkpoints/vae_epoch_80.pt",
+            "vae_config_path": "/home/jisookim/human_demon_action/vae_latent/config_vae_droid.yaml",
+            "freeze": true,
+            "normalize_input": true,
+            "image_size": 256
+        },
+        "noise_samples": 8
+    },
+    "observation": {
+        "modalities": {
+            "obs": {
+                "low_dim": [
+                    "ee_pos",
+                    "ee_ori",
+                    "gripper_states"
+                ],
+                "rgb": [
+                    "agentview_rgb",
+                    "eye_in_hand_rgb"
+                ],
+                "depth": [],
+                "scan": []
+            },
+            "goal": {
+                "low_dim": [],
+                "rgb": [
+                    "agentview_rgb",
+                    "eye_in_hand_rgb"
+                ],
+                "depth": [],
+                "scan": []
+            }
+        },
+        "encoder": {
+            "low_dim": {
+                "core_class": null,
+                "core_kwargs": {},
+                "obs_randomizer_class": null,
+                "obs_randomizer_kwargs": {}
+            },
+            "rgb": {
+                "core_class": "VisualCore",
+                "core_kwargs": {
+                    "feature_dimension": 512,
+                    "backbone_class": "ResNet50Conv",
+                    "backbone_kwargs": {
+                        "pretrained": true,
+                        "input_coord_conv": false,
+                        "use_cam": false,
+                        "downsample": false
+                    },
+                    "pool_class": null,
+                    "pool_kwargs": null,
+                    "flatten": true
+                },
+                "obs_randomizer_class": [
+                    "ColorRandomizer",
+                    "CropRandomizer"
+                ],
+                "obs_randomizer_kwargs": [
+                    {},
+                    {
+                        "crop_height": 232,
+                        "crop_width": 232,
+                        "num_crops": 1,
+                        "pos_enc": false
+                    }
+                ],
+                "fuser": null
+            },
+            "depth": {
+                "core_class": "VisualCore",
+                "core_kwargs": {},
+                "obs_randomizer_class": null,
+                "obs_randomizer_kwargs": {}
+            },
+            "scan": {
+                "core_class": "ScanCore",
+                "core_kwargs": {},
+                "obs_randomizer_class": null,
+                "obs_randomizer_kwargs": {}
+            }
+        },
+        "image_dim": [
+            256,
+            256
+        ],
+        "rotate_images_180": true
+    }
+}
+

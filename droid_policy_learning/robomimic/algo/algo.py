@@ -402,12 +402,28 @@ class PolicyAlgo(Algo):
     def compute_batch_visualize(self, batch, num_samples, savedir=None):
         visualize = savedir is not None
 
-        varied_cam_1_images = batch["obs"]['camera/image/varied_camera_1_left_image'][:num_samples][:, 0, :, :, :]
-        varied_cam_2_images = batch["obs"]['camera/image/varied_camera_2_left_image'][:num_samples][:, 0, :, :, :]
-        images = {
-            "varied_camera_1_image": varied_cam_1_images,
-            "varied_camera_2_image": varied_cam_2_images
-        }
+        # Dynamically detect image keys from batch
+        images = {}
+        obs_keys = list(batch["obs"].keys())
+        image_keys = [k for k in obs_keys if any(x in k for x in ["image", "rgb", "camera"])]
+        
+        for i, key in enumerate(image_keys[:2]):  # Take first 2 image keys
+            imgs = batch["obs"][key][:num_samples]
+            # Handle different image tensor shapes
+            if imgs.dim() == 5:  # (B, T, H, W, C) or (B, T, C, H, W)
+                imgs = imgs[:, 0]  # Take first timestep
+            # Convert to (B, H, W, C) format for matplotlib
+            if imgs.dim() == 4:
+                if imgs.shape[-1] in (1, 3):
+                    # Already in (B, H, W, C) format
+                    pass
+                elif imgs.shape[1] in (1, 3):
+                    # In (B, C, H, W) format, need to permute
+                    imgs = imgs.permute(0, 2, 3, 1)
+            # Create a short name for the key
+            short_name = key.split('/')[-1] if '/' in key else key
+            short_name = short_name.replace('_rgb', '').replace('_image', '')
+            images[f"camera_{i+1}_{short_name}"] = imgs
 
         goal_obs = batch.get("goal_obs", None)
         skill_keys = []
@@ -458,12 +474,23 @@ class PolicyAlgo(Algo):
         self.set_eval()
         eval_data = [d for d in trainset.datasets if "eval" in d.hdf5_path]
         broad_data = [d for d in trainset.datasets if "eval" not in d.hdf5_path]
-        if len(eval_data) < int(num_samples / 2):
-            training_sampled_data = random.sample(broad_data, int(num_samples))
-        elif len(broad_data) < int(num_samples / 2):
-            training_sampled_data = random.sample(eval_data, int(num_samples))
+        
+        # Ensure we sample at least num_samples trajectories
+        num_samples = max(1, num_samples)  # Ensure at least 1 sample
+        num_eval_samples = min(len(eval_data), max(1, int(num_samples / 2)))
+        num_broad_samples = max(1, num_samples - num_eval_samples)
+        
+        if len(eval_data) == 0:
+            # No eval data, sample all from broad data
+            training_sampled_data = random.sample(broad_data, min(len(broad_data), num_samples))
+        elif len(broad_data) == 0:
+            # No broad data, sample all from eval data
+            training_sampled_data = random.sample(eval_data, min(len(eval_data), num_samples))
         else:
-            training_sampled_data = random.sample(eval_data, int(num_samples / 2)) + random.sample(broad_data, int(num_samples / 2))
+            # Have both, sample from each
+            num_eval_samples = min(len(eval_data), num_eval_samples)
+            num_broad_samples = min(len(broad_data), num_samples - num_eval_samples)
+            training_sampled_data = random.sample(eval_data, num_eval_samples) + random.sample(broad_data, num_broad_samples)
 
         
         if validset is not None:

@@ -625,6 +625,20 @@ class SequenceDataset(torch.utils.data.Dataset):
             seq_end_pad = action_padding_len + 1
             seq_end_index = seq_end_index - action_padding_len - 1
 
+        # Ensure we have at least 1 frame: seq_begin_index < seq_end_index
+        # Adjust seq_begin_index based on seq_end_index to guarantee valid range
+        min_required_length = max(1, num_frames_to_stack)
+        if seq_end_index - seq_begin_index < min_required_length:
+            seq_begin_index = max(0, seq_end_index - min_required_length)
+            # Recalculate begin padding
+            seq_begin_pad = max(0, num_frames_to_stack - (index_in_demo - seq_begin_index))
+        
+        # Always ensure total length = seq_length + num_frames_to_stack
+        # This handles both normal cases and edge cases after adjustments
+        actual_frames = seq_end_index - seq_begin_index
+        total_required_length = seq_length + num_frames_to_stack
+        seq_end_pad = max(0, total_required_length - seq_begin_pad - actual_frames)
+
         # make sure we are not padding if specified.
         if not self.pad_frame_stack:
             assert seq_begin_pad == 0

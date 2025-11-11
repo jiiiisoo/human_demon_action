@@ -548,7 +548,14 @@ class DiffusionPolicyUNet(PolicyAlgo):
         # select network
         nets = self.nets
         if self.ema is not None:
-            nets = self.ema.averaged_model
+            # Handle different diffusers versions
+            if hasattr(self.ema, 'averaged_model'):
+                nets = self.ema.averaged_model  # Old API
+            else:
+                # New API: EMA model structure is different and not directly usable
+                # For evaluation/inference during training, use self.nets instead
+                # (EMA is mainly for saving checkpoints with smoothed weights)
+                nets = self.nets
         
         # encode obs
         inputs = {
@@ -578,13 +585,12 @@ class DiffusionPolicyUNet(PolicyAlgo):
                     goal_inputs = None
 
         skill_latent = None
-        # if self.skill_latent_dim > 0:
-        #     skill_latent = self._encode_skill_latent(goal_inputs)
-        #     if skill_latent is None:
-        #         skill_latent = obs_cond.new_zeros((obs_cond.shape[0], self.skill_latent_dim))
-        # if skill_latent is not None:
-        #     obs_cond = torch.cat([obs_cond, skill_latent], dim=-1)
-        skill_latent = self._encode_skill_latent(goal_inputs)
+        if self.skill_latent_dim > 0:
+            skill_latent = self._encode_skill_latent(goal_inputs)
+            # if skill_latent is None:
+            #     skill_latent = obs_cond.new_zeros((obs_cond.shape[0], self.skill_latent_dim))
+        if skill_latent is not None:
+            obs_cond = torch.cat([obs_cond, skill_latent], dim=-1)
 
 
         # initialize action from Guassian noise
@@ -627,17 +633,179 @@ class DiffusionPolicyUNet(PolicyAlgo):
             "ema": self.ema.state_dict() if self.ema is not None else None,
         }
 
-    def deserialize(self, model_dict):
+    def deserialize(self, model_dict, strict=True):
         """
         Load model from a checkpoint.
 
         Args:
             model_dict (dict): a dictionary saved by self.serialize() that contains
                 the same keys as @self.network_classes
+            strict (bool): whether to strictly enforce key matching when loading state dict
         """
-        self.nets.load_state_dict(model_dict["nets"])
+        checkpoint_state_dict = model_dict["nets"]
+        
+        if not strict:
+            # Filter out keys with size mismatches AND map visual encoder keys
+            current_state_dict = self.nets.state_dict()
+            filtered_state_dict = {}
+            size_mismatches = []
+            key_mappings = []
+            
+            # First, try direct matching and filtering
+            for key, checkpoint_param in checkpoint_state_dict.items():
+                if key in current_state_dict:
+                    current_param = current_state_dict[key]
+                    if checkpoint_param.shape == current_param.shape:
+                        filtered_state_dict[key] = checkpoint_param
+                    else:
+                        size_mismatches.append((key, checkpoint_param.shape, current_param.shape))
+            
+            # Second, try to map visual encoder weights across different observation keys
+            # This includes both backbone and other encoder layers
+            checkpoint_obs_keys = set()
+            current_obs_keys = set()
+            
+            # Extract observation keys from checkpoint (look for any obs_nets pattern)
+            for key in checkpoint_state_dict.keys():
+                if ".obs_nets." in key:
+                    # Key format: policy.obs_encoder.module.nets.obs.obs_nets.{OBS_KEY}.*
+                    parts = key.split(".obs_nets.")
+                    if len(parts) > 1:
+                        # Extract obs key (everything before the next dot after obs_nets)
+                        obs_part = parts[1]
+                        # Split by dots and take everything until we hit a numeric or common suffix
+                        if ".backbone." in obs_part:
+                            obs_key = obs_part.split(".backbone.")[0]
+                        elif ".nets." in obs_part:
+                            obs_key = obs_part.split(".nets.")[0]
+                        else:
+                            continue
+                        checkpoint_obs_keys.add(obs_key)
+            
+            # Extract observation keys from current model
+            for key in current_state_dict.keys():
+                if ".obs_nets." in key:
+                    parts = key.split(".obs_nets.")
+                    if len(parts) > 1:
+                        obs_part = parts[1]
+                        if ".backbone." in obs_part:
+                            obs_key = obs_part.split(".backbone.")[0]
+                        elif ".nets." in obs_part:
+                            obs_key = obs_part.split(".nets.")[0]
+                        else:
+                            continue
+                        current_obs_keys.add(obs_key)
+            
+            checkpoint_obs_list = sorted(list(checkpoint_obs_keys))
+            current_obs_list = sorted(list(current_obs_keys))
+            
+            if checkpoint_obs_list and current_obs_list:
+                print(f"\n[Checkpoint Loading] Attempting visual encoder mapping:")
+                print(f"  Checkpoint observation keys: {checkpoint_obs_list}")
+                print(f"  Current observation keys: {current_obs_list}")
+                
+                # Map checkpoint obs keys to current obs keys
+                for ckpt_key, curr_key in zip(checkpoint_obs_list, current_obs_list):
+                    for checkpoint_key, checkpoint_param in checkpoint_state_dict.items():
+                        # Check if this key belongs to the checkpoint obs key
+                        # Match both .backbone. and .nets. patterns
+                        if f".obs_nets.{ckpt_key}." in checkpoint_key:
+                            # Replace the obs key part
+                            new_key = checkpoint_key.replace(
+                                f".obs_nets.{ckpt_key}.", 
+                                f".obs_nets.{curr_key}."
+                            )
+                            
+                            # Only add if it exists in current model and shapes match
+                            if new_key in current_state_dict:
+                                if checkpoint_param.shape == current_state_dict[new_key].shape:
+                                    filtered_state_dict[new_key] = checkpoint_param
+                                    key_mappings.append((checkpoint_key, new_key))
+                
+                if key_mappings:
+                    print(f"  Successfully mapped {len(key_mappings)} visual encoder parameters")
+                    if len(checkpoint_obs_list) > 0 and len(current_obs_list) > 0:
+                        print(f"  Example mapping: {checkpoint_obs_list[0]} → {current_obs_list[0]}")
+            
+            checkpoint_state_dict = filtered_state_dict
+            
+            print(f"\n[Checkpoint Loading] strict=False mode with intelligent weight transfer:")
+            if key_mappings:
+                print(f"  ✓ Mapped visual encoder weights: {len(key_mappings)} parameters")
+            if size_mismatches:
+                print(f"  Size mismatches (will be randomly initialized): {len(size_mismatches)} keys")
+                for key, ckpt_shape, current_shape in size_mismatches[:3]:
+                    print(f"    - {key}: checkpoint {ckpt_shape} vs current {current_shape}")
+                if len(size_mismatches) > 3:
+                    print(f"    ... and {len(size_mismatches) - 3} more")
+        
+        missing_keys, unexpected_keys = self.nets.load_state_dict(checkpoint_state_dict, strict=strict)
+        
+        if not strict:
+            if missing_keys:
+                print(f"  Missing keys (will be randomly initialized): {len(missing_keys)} keys")
+                for key in list(missing_keys)[:5]:
+                    print(f"    - {key}")
+                if len(missing_keys) > 5:
+                    print(f"    ... and {len(missing_keys) - 5} more")
+            if unexpected_keys:
+                print(f"  Unexpected keys (ignored from checkpoint): {len(unexpected_keys)} keys")
+                for key in list(unexpected_keys)[:5]:
+                    print(f"    - {key}")
+                if len(unexpected_keys) > 5:
+                    print(f"    ... and {len(unexpected_keys) - 5} more")
+        
         if model_dict.get("ema", None) is not None:
-            self.ema.averaged_model.load_state_dict(model_dict["ema"])
+            try:
+                ema_state_dict = model_dict["ema"]
+                
+                # Check if ema_state_dict contains actual model weights (tensors) or just config (floats/ints)
+                import torch
+                has_model_weights = False
+                if isinstance(ema_state_dict, dict):
+                    for value in ema_state_dict.values():
+                        if isinstance(value, torch.Tensor):
+                            has_model_weights = True
+                            break
+                
+                if not has_model_weights:
+                    print(f"[Checkpoint Loading] ⚠ EMA config found but no model weights in checkpoint (will use current EMA)")
+                else:
+                    # Handle different diffusers versions
+                    # Try new API first (diffusers >= 0.35.0), then fall back to old API
+                    try:
+                        # New API: EMAModel.state_dict() directly
+                        if not strict:
+                            current_ema_state_dict = self.ema.state_dict()
+                            filtered_ema_state_dict = {}
+                            for key, checkpoint_param in ema_state_dict.items():
+                                if isinstance(checkpoint_param, torch.Tensor) and key in current_ema_state_dict:
+                                    if checkpoint_param.shape == current_ema_state_dict[key].shape:
+                                        filtered_ema_state_dict[key] = checkpoint_param
+                            ema_state_dict = filtered_ema_state_dict
+                        
+                        self.ema.load_state_dict(ema_state_dict, strict=strict)
+                        print(f"[Checkpoint Loading] ✓ EMA weights loaded (new API)")
+                    except (AttributeError, RuntimeError) as e1:
+                        # Old API: EMAModel.averaged_model.state_dict()
+                        try:
+                            if not strict:
+                                current_ema_state_dict = self.ema.averaged_model.state_dict()
+                                filtered_ema_state_dict = {}
+                                for key, checkpoint_param in ema_state_dict.items():
+                                    if isinstance(checkpoint_param, torch.Tensor) and key in current_ema_state_dict:
+                                        if checkpoint_param.shape == current_ema_state_dict[key].shape:
+                                            filtered_ema_state_dict[key] = checkpoint_param
+                                ema_state_dict = filtered_ema_state_dict
+                            
+                            self.ema.averaged_model.load_state_dict(ema_state_dict, strict=strict)
+                            print(f"[Checkpoint Loading] ✓ EMA weights loaded (old API)")
+                        except Exception as e2:
+                            print(f"[Checkpoint Loading] Warning: Could not load EMA weights")
+                            print(f"  Tried new API: {e1}")
+                            print(f"  Tried old API: {e2}")
+            except Exception as e:
+                print(f"[Checkpoint Loading] Warning: Could not load EMA weights: {e}")
 
     
             
@@ -929,7 +1097,8 @@ class ConditionalUnet1D(nn.Module):
             x = mid_module(x, global_feature)
 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
-            x = torch.cat((x, h.pop()), dim=1)
+            skip_feat = h.pop()
+            x = torch.cat((x, skip_feat), dim=1)
             x = resnet(x, global_feature)
             x = resnet2(x, global_feature)
             x = upsample(x)

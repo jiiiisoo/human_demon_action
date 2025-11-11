@@ -134,6 +134,10 @@ class BaseConfig(Config):
 
         # whether to load in a previously trained model checkpoint
         self.experiment.ckpt_path = None
+        
+        # whether to strictly enforce key matching when loading checkpoint
+        # Set to False for finetuning with different observation keys or action dimensions
+        self.experiment.strict_weight_loading = True
 
     def train_config(self):
         """
@@ -273,6 +277,7 @@ class BaseConfig(Config):
         in the algorithm. 
         """
         self.observation.image_dim = [] # For RLDS
+        self.observation.rotate_images_180 = False # For LIBERO (images stored upside down)
         # observation modalities
         self.observation.modalities.obs.low_dim = [             # specify low-dim observations for agent
             "robot0_eef_pos", 

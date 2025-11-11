@@ -338,7 +338,12 @@ def train(config, device):
         print("LOADING MODEL WEIGHTS FROM " + ckpt_path)
         from robomimic.utils.file_utils import maybe_dict_from_checkpoint
         ckpt_dict = maybe_dict_from_checkpoint(ckpt_path=ckpt_path)
-        model.deserialize(ckpt_dict["model"])
+        
+        # Use strict=False for finetuning to allow partial weight loading
+        # This is useful when observation keys or action dimensions differ
+        strict_loading = getattr(config.experiment, "strict_weight_loading", True)
+        print(f"Loading checkpoint with strict={strict_loading}")
+        model.deserialize(ckpt_dict["model"], strict=strict_loading)
 
     print("\n============= Model Summary =============")
     print(model)  # print model summary
@@ -530,7 +535,42 @@ def train(config, device):
 
                 print("MSE Log Epoch {}".format(epoch))
                 print(json.dumps(mse_log, sort_keys=True, indent=4))
+            
+            # Also compute batch visualization for HDF5 (like RLDS does)
+            should_save_batch_samples = False
+            if config.experiment.mse.enabled:
+                if config.experiment.mse.every_n_epochs is not None and epoch % config.experiment.mse.every_n_epochs == 0:
+                    should_save_batch_samples = True
+                if config.experiment.mse.on_save_ckpt and should_save_ckpt:
+                    should_save_batch_samples = True
+            if should_save_batch_samples:
+                print("Computing Batch Visualization ...")
+                if config.experiment.mse.visualize:
+                    save_vis_dir = os.path.join(vis_dir, epoch_ckpt_name)
+                else:
+                    save_vis_dir = None
+                
+                # Get a batch for visualization (HDF5 dataset)
+                vis_data_loader_iter = iter(train_loader)
+                batch_to_visualize = next(vis_data_loader_iter)
+                batch_to_visualize = model.process_batch_for_training(batch_to_visualize)
+                batch_to_visualize = model.postprocess_batch_for_training(
+                    batch_to_visualize, 
+                    obs_normalization_stats=obs_normalization_stats
+                )
+                
+                vis_log = model.compute_batch_visualize(
+                    batch=batch_to_visualize,
+                    num_samples=config.experiment.mse.num_samples,
+                    savedir=save_vis_dir,
+                )
+
+                for k, v in vis_log.items():
+                    data_logger.record("{}".format(k), v, epoch, data_type='image')
+
+                print("Batch Log Epoch {}".format(epoch))
         else:
+            # RLDS dataset - use pre-loaded rlds_batch
             should_save_batch_samples = False
             # TODO(Ashwin): eventually clean up to use different config parameters for
             # batch visualization vs. mse visualization
@@ -545,6 +585,7 @@ def train(config, device):
                     save_vis_dir = os.path.join(vis_dir, epoch_ckpt_name)
                 else:
                     save_vis_dir = None
+                
                 vis_log = model.compute_batch_visualize(
                     batch=rlds_batch,
                     num_samples=config.experiment.mse.num_samples,

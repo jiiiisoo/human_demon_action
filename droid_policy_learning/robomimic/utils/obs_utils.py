@@ -44,6 +44,14 @@ OBS_MODALITY_CLASSES = {}
 OBS_ENCODER_CORES = {"None": None}          # Include default None
 OBS_RANDOMIZERS = {"None": None}            # Include default None
 
+# DO NOT MODIFY THIS
+# This stores the target image dimension for resizing (set via config)
+IMAGE_DIM = None
+
+# DO NOT MODIFY THIS
+# This stores whether to rotate images 180 degrees (for LIBERO dataset)
+ROTATE_IMAGES_180 = False
+
 
 def register_obs_key(target_class):
     assert target_class not in OBS_MODALITY_CLASSES, f"Already registered modality {target_class}!"
@@ -252,6 +260,17 @@ def initialize_obs_utils_with_config(config):
         obs_encoder_config = config.observation.encoder
     initialize_obs_utils_with_obs_specs(obs_modality_specs=obs_modality_specs)
     initialize_default_obs_encoder(obs_encoder_config=obs_encoder_config)
+    
+    # Set IMAGE_DIM for resizing if specified in config
+    global IMAGE_DIM, ROTATE_IMAGES_180
+    if hasattr(config.observation, 'image_dim') and config.observation.image_dim:
+        IMAGE_DIM = tuple(config.observation.image_dim)
+        print(f"[ObsUtils] IMAGE_DIM set to {IMAGE_DIM} for automatic image resizing")
+    
+    # Set ROTATE_IMAGES_180 for LIBERO dataset if specified in config
+    if hasattr(config.observation, 'rotate_images_180') and config.observation.rotate_images_180:
+        ROTATE_IMAGES_180 = True
+        print(f"[ObsUtils] ROTATE_IMAGES_180 enabled (for LIBERO dataset)")
 
 
 def key_is_obs_modality(key, obs_modality):
@@ -367,7 +386,7 @@ def process_frame(frame, channel_dim, scale):
     """
     Given frame fetched from dataset, process for network input. Converts array
     to float (from uint8), normalizes pixels from range [0, @scale] to [0, 1], and channel swaps
-    from (H, W, C) to (C, H, W).
+    from (H, W, C) to (C, H, W). Optionally resizes to IMAGE_DIM if set.
 
     Args:
         frame (np.array or torch.Tensor): frame array
@@ -377,8 +396,58 @@ def process_frame(frame, channel_dim, scale):
     Returns:
         processed_frame (np.array or torch.Tensor): processed frame
     """
+    global IMAGE_DIM, ROTATE_IMAGES_180
+    
     # Channel size should either be 3 (RGB) or 1 (depth) or 6 (goal image RGB)
     assert (frame.shape[-1] == channel_dim) or (frame.shape[-1] == channel_dim*2)
+    
+    # Rotate 180 degrees if flag is set (for LIBERO dataset)
+    if ROTATE_IMAGES_180:
+        if isinstance(frame, torch.Tensor):
+            # Rotate H and W dimensions (axes -3 and -2 since last is C)
+            frame = torch.rot90(frame, 2, dims=[-3, -2])
+        else:
+            # numpy array - rotate H and W dimensions
+            frame = np.rot90(frame, 2, axes=(-3, -2))
+    
+    # Resize if IMAGE_DIM is set and frame size doesn't match
+    if IMAGE_DIM is not None and len(IMAGE_DIM) == 2:
+        target_h, target_w = IMAGE_DIM
+        # Get H, W dimensions (they are at positions -3, -2, last is channel)
+        current_h, current_w = frame.shape[-3], frame.shape[-2]
+        if (current_h != target_h) or (current_w != target_w):
+            # Handle different input shapes: (..., H, W, C)
+            original_shape = frame.shape
+            is_batched = len(original_shape) > 3
+            
+            if is_batched:
+                # Flatten leading dimensions: (..., H, W, C) -> (N, H, W, C)
+                leading_dims = original_shape[:-3]
+                n_frames = int(np.prod(leading_dims))
+                frame = frame.reshape(n_frames, current_h, current_w, original_shape[-1])
+            
+            # Resize using torch or numpy depending on input type
+            if isinstance(frame, torch.Tensor):
+                # frame is (N, H, W, C), need (N, C, H, W) for torch resize
+                frame = frame.permute(0, 3, 1, 2) if is_batched else frame.permute(2, 0, 1).unsqueeze(0)
+                frame = F.interpolate(frame, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                frame = frame.permute(0, 2, 3, 1) if is_batched else frame.squeeze(0).permute(1, 2, 0)
+            else:
+                # numpy array
+                import cv2
+                if is_batched:
+                    resized_frames = []
+                    for i in range(frame.shape[0]):
+                        resized = cv2.resize(frame[i], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                        resized_frames.append(resized)
+                    frame = np.stack(resized_frames, axis=0)
+                else:
+                    frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            
+            if is_batched:
+                # Restore original leading dimensions
+                frame = frame.reshape(*leading_dims, target_h, target_w, original_shape[-1])
+    
     frame = TU.to_float(frame)
     frame /= scale
     frame = frame.clip(0.0, 1.0)
