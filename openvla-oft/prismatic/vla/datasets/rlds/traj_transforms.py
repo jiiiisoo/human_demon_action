@@ -45,6 +45,11 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
 
     traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])
     traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
+    # expose chunk indices for downstream lookups (e.g., pointcloud/track slicing)
+    traj["chunk_indices_raw"] = chunk_indices
+    traj["action_chunk_indices_raw"] = action_chunk_indices
+    traj["chunk_indices"] = floored_chunk_indices
+    traj["action_chunk_indices"] = floored_action_chunk_indices
 
     # indicates whether an entire observation is padding
     traj["observation"]["pad_mask"] = chunk_indices >= 0
@@ -53,6 +58,8 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     traj["task"] = tf.nest.map_structure(lambda x: tf.gather(x, tf.range(effective_traj_len)), traj["task"])
     traj["dataset_name"] = tf.gather(traj["dataset_name"], tf.range(effective_traj_len))
     traj["absolute_action_mask"] = tf.gather(traj["absolute_action_mask"], tf.range(effective_traj_len))
+    if "episode_name" in traj:
+        traj["episode_name"] = tf.gather(traj["episode_name"], tf.range(effective_traj_len))
 
     return traj
 

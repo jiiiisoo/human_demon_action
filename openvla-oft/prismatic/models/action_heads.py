@@ -1,6 +1,7 @@
 """Implementations of various action heads, which serve as alternatives to VLM sequential token prediction."""
 
 import math
+from typing import Optional
 
 import numpy as np
 import torch
@@ -232,10 +233,11 @@ class PointTrackingHead(nn.Module):
             output_dim=num_points * tracking_dim,
         )
 
-    def predict_tracking(self, actions_hidden_states: torch.Tensor) -> torch.Tensor:
+    def predict_tracking(self, actions_hidden_states: torch.Tensor, pointcloud: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             actions_hidden_states: Hidden states for action tokens, shape (B, chunk_len * action_dim, hidden_dim).
+            pointcloud: Optional base pointcloud (unused for this head).
 
         Returns:
             torch.Tensor: Predicted tracking outputs with shape (B, chunk_len, num_points, tracking_dim).
@@ -244,6 +246,60 @@ class PointTrackingHead(nn.Module):
         rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
         tracking_flat = self.model(rearranged_actions_hidden_states)
         tracking = tracking_flat.reshape(batch_size, NUM_ACTIONS_CHUNK, self.num_points, self.tracking_dim)
+        return tracking
+
+
+class PointTrackingHeadWithPointInput(nn.Module):
+    """Predicts per-frame point tracking targets conditioning on action states and base pointcloud."""
+
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        point_hidden_dim=4096,
+        num_points=64,
+        tracking_dim=3,
+        num_blocks: int = 2,
+    ):
+        super().__init__()
+        self.num_points = num_points
+        self.tracking_dim = tracking_dim
+        self.point_mlp = nn.Sequential(
+            nn.Linear(tracking_dim, point_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(point_hidden_dim, hidden_dim),
+        )
+        self.ctx_mlp = MLPResNet(
+            num_blocks=num_blocks,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+        )
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, tracking_dim),
+        )
+
+    def predict_tracking(self, actions_hidden_states: torch.Tensor, pointcloud: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            actions_hidden_states: Hidden states for action tokens, shape (B, chunk_len * action_dim, hidden_dim).
+            pointcloud: Base pointcloud, shape (B, num_points, tracking_dim).
+
+        Returns:
+            torch.Tensor: Predicted tracking outputs with shape (B, chunk_len, num_points, tracking_dim).
+        """
+        if pointcloud is None:
+            raise ValueError("PointTrackingHeadWithPointInput requires a pointcloud input.")
+        batch_size = actions_hidden_states.shape[0]
+        ctx = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+        ctx_feat = self.ctx_mlp(ctx)  # (B, T, H)
+        point_feat = self.point_mlp(pointcloud)  # (B, N, H)
+        ctx_expanded = ctx_feat.unsqueeze(2).expand(-1, -1, self.num_points, -1)  # (B, T, N, H)
+        pt_expanded = point_feat.unsqueeze(1).expand(-1, NUM_ACTIONS_CHUNK, -1, -1)  # (B, T, N, H)
+        fusion = torch.cat([ctx_expanded, pt_expanded], dim=-1)  # (B, T, N, 2H)
+        tracking = self.fusion_mlp(fusion)  # (B, T, N, tracking_dim)
         return tracking
 
 # class PointTrackingHead(nn.Module):

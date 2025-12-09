@@ -1,10 +1,12 @@
-torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune.py \
+torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
   --vla_path openvla/openvla-7b \
   --dataset_name libero_goal_no_noops \
   --data_root_dir /mnt/data/modified_libero_rlds \
   --use_tracking_head True \
   --tracking_dim 3 \
   --tracking_num_points 5000 \
+  --save_tracking_viz True \
+  --tracking_viz_freq 100 \
   --tracking_label_key '' \
   --use_pointcloud_input True \
   --pointcloud_input_num_points 5000 \
@@ -27,6 +29,6 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune.py \
   --use_tensorboard True \
   --tensorboard_log_dir /home/jisookim/openvla-oft/runs/tensorboard_track_512_use_input \
   --run_root_dir /mnt/data/jisookim/openvla_finetune/track_512_use_input \
-  --tracking_tracks_root /mnt/data/libero/modified_libero_mesh_with_tracks/1.0.0 \
-  --tracking_tracks_filename vertex_tracks.npy \
+  --tracking_tracks_root /mnt/data/libero/modified_libero_meshes_tracks_hash_final/1.0.0 \
+  --tracking_tracks_filename vertex_tracks_face_uniform.npy \
   --use_pointcloud_from_tracks True \

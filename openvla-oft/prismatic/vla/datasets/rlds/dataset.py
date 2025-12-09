@@ -5,6 +5,7 @@ Core interface script for configuring and initializing RLDS datasets.
 """
 
 import copy
+import hashlib
 import inspect
 import json
 from functools import partial
@@ -27,6 +28,8 @@ from prismatic.vla.datasets.rlds.utils.data_utils import (
     tree_map,
 )
 import tensorflow as tf
+import numpy as np
+import os
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -175,12 +178,16 @@ def make_dataset_from_rlds(
         # add timestep info
         new_obs["timestep"] = tf.range(traj_len)
 
-        # attach episode file path for external lookups (e.g., point clouds on disk)
+        # episode_name should already be attached before restructure; if missing, fill with empty string
+        if "episode_name" not in traj:
+            traj["episode_name"] = tf.repeat("", traj_len)
 
         # attach trajectory / frame indices for external lookup
         new_obs["traj_index"] = tf.cast(traj["_traj_index"], tf.int64)
         new_obs["frame_index"] = tf.cast(traj["_frame_index"], tf.int64)
         new_obs["traj_len"] = tf.cast(traj["_len"], tf.int64)
+        # print(f'restructure: traj_len: {traj_len}, traj_index: {np.asarray(traj["_traj_index"])}, frame_index: {np.asarray(traj["_frame_index"])}, traj_len: {np.asarray(traj["_len"])}')
+        # 1/0
 
         # pass through any additional observation fields (e.g., point tracking / point clouds)
         handled_old_obs_keys = {
@@ -210,6 +217,7 @@ def make_dataset_from_rlds(
             "task": task,
             "action": tf.cast(traj["action"], tf.float32),
             "dataset_name": tf.repeat(name, traj_len),
+            "episode_name": traj["episode_name"],
         }
 
         if absolute_action_mask is not None:
@@ -261,6 +269,24 @@ def make_dataset_from_rlds(
 
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=False, num_parallel_reads=num_parallel_reads)
 
+    # attach episode hash before any further processing
+    def add_episode_name(traj):
+        traj_len = tf.shape(traj["action"])[0]
+
+        def _episode_hash(a, f, leng):
+            a_np = np.asarray(a)
+            f_np = np.asarray(f)
+            h = hashlib.sha1()
+            h.update(a_np.tobytes())
+            h.update(f_np.tobytes())
+            return f"episode_{h.hexdigest()[:16]}".encode("utf-8")
+
+        episode_name = tf.py_function(_episode_hash, [traj["action"], traj["_frame_index"], traj["_len"]], tf.string)
+        episode_name.set_shape([])
+        traj["episode_name"] = tf.repeat(episode_name, traj_len)
+        return traj
+
+    dataset = dataset.traj_map(add_episode_name, num_parallel_calls)
     dataset = dataset.traj_map(restructure, num_parallel_calls)
     dataset = dataset.traj_map(
         partial(

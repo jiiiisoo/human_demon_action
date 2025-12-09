@@ -32,6 +32,15 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
 import open3d as o3d
+try:
+    import imageio.v2 as imageio
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    imageio = None
+    plt = None
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -42,7 +51,7 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, PointTrackingHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, PointTrackingHead, PointTrackingHeadWithPointInput
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -105,6 +114,13 @@ class FinetuneConfig:
     tracking_num_blocks: int = 2                     # Number of MLP blocks for tracking head
     tracking_loss_weight: float = 1.0                # Scaling factor for tracking loss term
     tracking_label_key: Optional[str] = None         # Dot-delimited key into RLDS batch for point tracking labels
+    tracking_use_point_features: bool = False        # If True, fuse base pointcloud into tracking head
+    tracking_point_hidden_dim: int = 0               # Hidden dim for point branch in tracking head (0 => use tracking_hidden_dim/llm_dim)
+    tracking_use_pointcloud_input: bool = False      # If True, reuse VLA input pointcloud for tracking head fusion
+    save_tracking_viz: bool = False                  # If True, save tracking pred/gt visualizations during training
+    tracking_viz_freq: int = 100                     # Save tracking visualizations every N gradient steps
+    tracking_viz_max_points: int = 2000              # Max points to render in tracking visualizations (for speed)
+    tracking_viz_dir: Optional[Path] = None          # Optional override directory for tracking visualizations
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -311,7 +327,12 @@ def run_forward_pass(
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     tracking_loss_weight=1.0,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+    capture_tracking: bool = False,
+    tracking_use_point_features: bool = False,
+    tracking_use_pointcloud_input: bool = False,
+    tracking_num_points: Optional[int] = None,
+    tracking_dim: Optional[int] = None,
+) -> Tuple[torch.Tensor, Dict[str, float], Optional[Dict[str, torch.Tensor]]]:
     """
     Compute model forward pass and metrics for both training and validation.
 
@@ -338,11 +359,13 @@ def run_forward_pass(
         tracking_loss_weight (float): Weighting factor for tracking loss term.
 
     Returns:
-        tuple: (loss, metrics_dict)
+        tuple: (loss, metrics_dict, tracking_debug)
             loss: The loss tensor with gradient for backpropagation.
             metrics_dict: Dictionary of computed metrics (detached values for logging).
+            tracking_debug: Optional dict containing predicted/ground-truth tracking and pointcloud input (CPU).
     """
     metrics = {}
+    tracking_debug_data: Optional[Dict[str, torch.Tensor]] = None
 
     # Get ground-truth action labels
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
@@ -352,6 +375,28 @@ def run_forward_pass(
     pointcloud_input = batch.get("pointcloud")
     if pointcloud_input is not None:
         pointcloud_input = pointcloud_input.to(device_id).to(torch.bfloat16)
+    tracking_pointcloud = batch.get("tracking_pointcloud")
+    if tracking_pointcloud is not None:
+        tracking_pointcloud = tracking_pointcloud.to(device_id).to(torch.bfloat16)
+    def _pad_or_trim_tracking_pc(pc: torch.Tensor) -> torch.Tensor:
+        # Accepts (N, dim) or (B, N, dim)
+        batch_first = pc.dim() == 3
+        if not batch_first:
+            pc = pc.unsqueeze(0)
+        B, N, D = pc.shape
+        if tracking_dim is not None and D != tracking_dim:
+            if D > tracking_dim:
+                pc = pc[:, :, :tracking_dim]
+            else:
+                pad_dim = torch.zeros(B, N, tracking_dim - D, dtype=pc.dtype, device=pc.device)
+                pc = torch.cat([pc, pad_dim], dim=2)
+        if tracking_num_points is not None and N != tracking_num_points:
+            if N > tracking_num_points:
+                pc = pc[:, :tracking_num_points]
+            else:
+                pad = torch.zeros(B, tracking_num_points - N, pc.shape[2], dtype=pc.dtype, device=pc.device)
+                pc = torch.cat([pc, pad], dim=1)
+        return pc if batch_first else pc.squeeze(0)
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
     if use_diffusion:
@@ -465,7 +510,16 @@ def run_forward_pass(
         if use_tracking_head and tracking_labels is not None:
             if tracking_head is None:
                 raise ValueError("Tracking head is required but not provided.")
-            predicted_tracking = tracking_head.module.predict_tracking(actions_hidden_states)
+            tracking_pointcloud_for_head = None
+            if tracking_use_point_features:
+                if tracking_use_pointcloud_input and pointcloud_input is not None:
+                    tracking_pointcloud_for_head = _pad_or_trim_tracking_pc(pointcloud_input)
+                elif tracking_pointcloud is not None:
+                    tracking_pointcloud_for_head = _pad_or_trim_tracking_pc(tracking_pointcloud)
+            predicted_tracking = tracking_head.module.predict_tracking(
+                actions_hidden_states,
+                pointcloud=tracking_pointcloud_for_head,
+            )
             tracking_l1_loss = torch.nn.L1Loss()(predicted_tracking, tracking_labels)
             weighted_tracking_loss = tracking_loss_weight * tracking_l1_loss
             loss = weighted_tracking_loss if loss is None else loss + weighted_tracking_loss
@@ -474,6 +528,22 @@ def run_forward_pass(
                     "tracking_l1_loss": tracking_l1_loss.item(),
                 }
             )
+            if capture_tracking:
+                if pointcloud_input is not None:
+                    tracking_debug_data = {
+                        "predicted_tracking": predicted_tracking[:1].detach().to(torch.float32).cpu(),
+                        "tracking_labels": tracking_labels[:1].detach().to(torch.float32).cpu(),
+                        "pointcloud_input": pointcloud_input[:1].detach().to(torch.float32).cpu()
+                        if pointcloud_input is not None
+                        else None,
+                    }
+                elif tracking_pointcloud is not None:
+                    print(f'tracking_pointcloud shape: {tracking_pointcloud.shape}')
+                    tracking_debug_data = {
+                        "predicted_tracking": predicted_tracking[:1].detach().to(torch.float32).cpu(),
+                        "tracking_labels": tracking_labels[:1].detach().to(torch.float32).cpu(),
+                        "pointcloud_input": tracking_pointcloud[:1].detach().to(torch.float32).cpu()
+                    }
             if tracking_labels.shape[1] >= 1:
                 ground_truth_curr_tracking = tracking_labels[:, 0]
                 predicted_curr_tracking = predicted_tracking[:, 0]
@@ -513,7 +583,7 @@ def run_forward_pass(
             )
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
-    return loss, metrics
+    return loss, metrics, tracking_debug_data
 
 
 def run_diffusion_sampling(
@@ -603,6 +673,112 @@ def run_diffusion_sampling(
         curr_noisy_actions = action_head.module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
 
     return curr_noisy_actions.reshape(actions_shape)
+
+
+TRACKING_VIZ_DEPS_AVAILABLE = imageio is not None and plt is not None
+_TRACKING_VIZ_DEP_WARNED = False
+_TRACKING_PC_FALLBACK_WARNED = False
+
+
+def _ensure_tracking_viz_deps():
+    global _TRACKING_VIZ_DEP_WARNED
+    if TRACKING_VIZ_DEPS_AVAILABLE:
+        return True
+    if not _TRACKING_VIZ_DEP_WARNED:
+        print("Tracking visualization skipped: imageio/matplotlib not available.")
+        _TRACKING_VIZ_DEP_WARNED = True
+    return False
+
+
+def _pad_or_trim_base_np(base_pc: Optional[np.ndarray], num_points: int, dim: int) -> np.ndarray:
+    if base_pc is None:
+        base_pc = np.zeros((num_points, dim), dtype=np.float32)
+    else:
+        base_pc = base_pc.astype(np.float32)
+    if base_pc.shape[0] > num_points:
+        base_pc = base_pc[:num_points]
+    elif base_pc.shape[0] < num_points:
+        pad = np.zeros((num_points - base_pc.shape[0], base_pc.shape[1]), dtype=base_pc.dtype)
+        base_pc = np.concatenate([base_pc, pad], axis=0)
+    if base_pc.shape[1] > dim:
+        base_pc = base_pc[:, :dim]
+    elif base_pc.shape[1] < dim:
+        pad_dim = np.zeros((base_pc.shape[0], dim - base_pc.shape[1]), dtype=base_pc.dtype)
+        base_pc = np.concatenate([base_pc, pad_dim], axis=1)
+    return base_pc
+
+
+def _build_tracking_sequence(
+    base_pc: Optional[np.ndarray], deltas_or_positions: np.ndarray, treat_as_delta: bool
+) -> np.ndarray:
+    num_points = deltas_or_positions.shape[1]
+    dim = deltas_or_positions.shape[2] if deltas_or_positions.ndim >= 3 else 3
+    base_pc = _pad_or_trim_base_np(base_pc, num_points, dim)
+    if treat_as_delta:
+        cum_deltas = np.cumsum(deltas_or_positions, axis=0)
+        return np.concatenate([base_pc[None, ...], base_pc[None, ...] + cum_deltas], axis=0)
+    return np.concatenate([base_pc[None, ...], deltas_or_positions], axis=0)
+
+
+def _downsample_sequence_points(sequence: np.ndarray, max_points: Optional[int]) -> np.ndarray:
+    if max_points is None or max_points <= 0 or sequence.shape[1] <= max_points:
+        return sequence
+    return sequence[:, :max_points]
+
+
+def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps: int = 5) -> None:
+    if not _ensure_tracking_viz_deps():
+        return
+    if points_seq.size == 0:
+        return
+    video_path = Path(video_path)
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_axis_off()
+    pts_all = points_seq.reshape(-1, 3)
+    pts_all = pts_all - pts_all.mean(axis=0, keepdims=True)
+    max_range = np.linalg.norm(pts_all, axis=1).max() + 1e-6
+    ax.set_xlim3d([-max_range, max_range])
+    ax.set_ylim3d([-max_range, max_range])
+    ax.set_zlim3d([-max_range, max_range])
+    scatter = ax.scatter([], [], [], s=1)
+    writer = imageio.get_writer(video_path, fps=fps)
+    for pts in points_seq:
+        pts = pts - pts.mean(axis=0, keepdims=True)
+        ax.view_init(elev=20.0, azim=45.0)
+        scatter._offsets3d = (pts[:, 0], pts[:, 1], pts[:, 2])
+        fig.canvas.draw()
+        frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        writer.append_data(frame)
+    writer.close()
+    plt.close(fig)
+
+
+def save_tracking_visualizations(
+    tracking_debug: Dict[str, torch.Tensor],
+    output_dir: Path,
+    log_step: int,
+    tracking_labels_are_deltas: bool,
+    max_points: Optional[int],
+) -> None:
+    if not _ensure_tracking_viz_deps():
+        return
+    pred = tracking_debug.get("predicted_tracking")
+    gt = tracking_debug.get("tracking_labels")
+    base_pc = tracking_debug.get("pointcloud_input")
+    if pred is None or gt is None:
+        return
+    pred_np = pred[0].to(torch.float32).cpu().numpy()
+    gt_np = gt[0].to(torch.float32).cpu().numpy()
+    base_np = base_pc[0].to(torch.float32).cpu().numpy() if base_pc is not None else None
+    pred_seq = _build_tracking_sequence(base_np, pred_np, treat_as_delta=tracking_labels_are_deltas)
+    gt_seq = _build_tracking_sequence(base_np, gt_np, treat_as_delta=tracking_labels_are_deltas)
+    pred_seq = _downsample_sequence_points(pred_seq, max_points)
+    gt_seq = _downsample_sequence_points(gt_seq, max_points)
+    output_dir = Path(output_dir)
+    _save_tracking_sequence_video(pred_seq, output_dir / f"tracking_pred_step_{log_step:06d}.mp4")
+    _save_tracking_sequence_video(gt_seq, output_dir / f"tracking_gt_step_{log_step:06d}.mp4")
 
 
 def compute_smoothened_metrics(metrics_deques) -> dict:
@@ -817,7 +993,7 @@ def run_validation(
     with torch.no_grad():
         for batch in val_dataloader:
             # Always compute L1 loss for validation, even for diffusion
-            _, metrics = run_forward_pass(
+            _, metrics, _ = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
                 noisy_action_projector=noisy_action_projector,
@@ -837,6 +1013,11 @@ def run_validation(
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 tracking_loss_weight=cfg.tracking_loss_weight,
+                capture_tracking=False,
+                tracking_use_point_features=cfg.tracking_use_point_features,
+                tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+                tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
+                tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
             )
 
             # Add the loss value to the metrics
@@ -894,10 +1075,17 @@ def finetune(cfg: FinetuneConfig) -> None:
             or cfg.pointcloud_root is not None
             or cfg.tracking_tracks_root is not None
         ), "Provide tracking_label_key or pointcloud_root or tracking_tracks_root when using the tracking head."
+        if cfg.tracking_use_pointcloud_input:
+            assert cfg.use_pointcloud_input, "tracking_use_pointcloud_input=True requires use_pointcloud_input=True."
+        if cfg.tracking_use_point_features and cfg.use_pointcloud_from_tracks:
+            assert cfg.tracking_tracks_root is not None, "use_pointcloud_from_tracks=True requires tracking_tracks_root."
     if cfg.use_pointcloud_from_tracks:
         assert (
             cfg.tracking_tracks_root is not None
         ), "use_pointcloud_from_tracks=True requires tracking_tracks_root with track npy files."
+    if cfg.save_tracking_viz:
+        assert cfg.use_tracking_head, "save_tracking_viz requires use_tracking_head=True."
+        assert cfg.tracking_viz_freq > 0, "tracking_viz_freq must be > 0 when saving tracking visualizations."
     if cfg.use_pointcloud_input:
         assert (
             cfg.pointcloud_root is not None or cfg.use_pointcloud_from_tracks
@@ -1085,18 +1273,26 @@ def finetune(cfg: FinetuneConfig) -> None:
     # If applicable, instantiate tracking head
     if cfg.use_tracking_head:
         tracking_hidden_dim = cfg.tracking_hidden_dim if cfg.tracking_hidden_dim > 0 else vla.module.llm_dim
+        tracking_point_hidden_dim = (
+            cfg.tracking_point_hidden_dim if cfg.tracking_point_hidden_dim > 0 else tracking_hidden_dim
+        )
+        tracking_head_cls = PointTrackingHeadWithPointInput if cfg.tracking_use_point_features else PointTrackingHead
+        tracking_module_args = {
+            "input_dim": vla.module.llm_dim,
+            "hidden_dim": tracking_hidden_dim,
+            "point_hidden_dim": tracking_point_hidden_dim,
+            "num_points": cfg.tracking_num_points,
+            "tracking_dim": cfg.tracking_dim,
+            "num_blocks": cfg.tracking_num_blocks,
+        }
+        if not cfg.tracking_use_point_features:
+            tracking_module_args.pop("point_hidden_dim")
         tracking_head = init_module(
-            PointTrackingHead,
+            tracking_head_cls,
             "tracking_head",
             cfg,
             device_id,
-            {
-                "input_dim": vla.module.llm_dim,
-                "hidden_dim": tracking_hidden_dim,
-                "num_points": cfg.tracking_num_points,
-                "tracking_dim": cfg.tracking_dim,
-                "num_blocks": cfg.tracking_num_blocks,
-            },
+            tracking_module_args,
             to_bf16=True,
         )
 
@@ -1164,6 +1360,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     pointcloud_loader = None
     pointcloud_input_loader = None
     tracking_tracks_loader = None
+    tracking_pointcloud_loader = None
 
     def pad_or_trim_pointcloud(pc: torch.Tensor, max_points: Optional[int], dim: Optional[int]) -> torch.Tensor:
         """Utility to pad/trim pointclouds to fixed shape."""
@@ -1188,15 +1385,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         def pointcloud_loader_fn(rlds_batch):
             obs = rlds_batch.get("observation", {})
 
-            traj_indices = obs.get("traj_index")
             frame_indices = obs.get("frame_index")
             timesteps = obs.get("timestep")
             traj_lens = obs.get("traj_len")
+            episode_name = rlds_batch.get("episode_name").decode("utf-8")
+            
 
             chunk_len = rlds_batch["action"].shape[0]
             pcs = []
 
-            ep_idx_anchor = int(traj_indices[0]) if traj_indices is not None and traj_indices.shape[0] > 0 else None
             step_idx_anchor = (
                 int(frame_indices[0])
                 if frame_indices is not None and frame_indices.shape[0] > 0
@@ -1207,31 +1404,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             )
 
             for i in range(chunk_len):
-                ep_idx = ep_idx_anchor
-                # pointcloud is saved from initial frame
-                step_idx = step_idx_anchor + i + 1 if step_idx_anchor is not None else None
-                ep_id = f"episode_{ep_idx:05d}"
+                # pointcloud is not saved from initial frame
+                step_idx = step_idx_anchor + i -1 if step_idx_anchor is not None else None
+                if step_idx < 0:
+                    step_idx = 0
+                # ep_id = f"episode_{ep_idx:05d}"
 
-                pc_path = pc_root / ep_id / cfg.pointcloud_subdir / f"step_{step_idx:04d}{cfg.pointcloud_ext}"
-
-                if ep_id not in pc_len_cache:
-                    pc_len_cache[ep_id] = len(
-                        list((pc_root / ep_id / cfg.pointcloud_subdir).glob(f"step_*{cfg.pointcloud_ext}"))
-                    ) - 1
-                # if traj_len_anchor is not None and pc_len_cache.get(ep_id, 0) != traj_len_anchor:
-                #     print(f"Episode {ep_id} has {pc_len_cache.get(ep_id, 0)} pointclouds, but expected {traj_len_anchor}")
-                #     return None
-                if i < chunk_len//2 and not pc_path.exists():
-                    # print(f"Pointcloud file {pc_path} does not exist")
+                pc_path = pc_root / episode_name / cfg.pointcloud_subdir / f"step_{step_idx:04d}{cfg.pointcloud_ext}"
+                pc_len_cache[episode_name] = len(list((pc_root / episode_name / cfg.pointcloud_subdir).glob(f"step_*{cfg.pointcloud_ext}")))
+                if traj_lens != pc_len_cache[episode_name] :
+                    print(f'episode {episode_name} has {traj_lens} actions, but {pc_len_cache[episode_name]} pointclouds')
                     return None
-                    # pcs.append(None)
-                    # continue
-                elif i >= chunk_len//2 and not pc_path.exists():
-                    # print(f"Pointcloud file {pc_path} pad")
-                    pc = pc
-                    pcs.append(pc)
                 
-                elif pc_path.exists():
+                if pc_path.exists():
                     # print(f"Pointcloud file {pc_path} exists")
                     pc_o3d = o3d.io.read_point_cloud(str(pc_path))
                     pc = torch.from_numpy(np.asarray(pc_o3d.points)).float()
@@ -1239,6 +1424,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                     dim = cfg.tracking_dim if cfg.tracking_dim else None
                     pc = pad_or_trim_pointcloud(pc, max_points, dim)
                     pcs.append(pc)
+                else :
+                    print(f'timestep is later than the last pointcloud')
+                    return None
 
             if any(p is None for p in pcs) or all(p is None for p in pcs):
                 return None
@@ -1254,31 +1442,32 @@ def finetune(cfg: FinetuneConfig) -> None:
                 traj_indices = obs.get("traj_index")
                 frame_indices = obs.get("frame_index")
                 timesteps = obs.get("timestep")
+                episode_name = rlds_batch.get("episode_name").decode("utf-8")
 
-                ep_idx = int(traj_indices[0]) if traj_indices is not None and traj_indices.shape[0] > 0 else None
                 step_idx = (
                     int(frame_indices[0])
                     if frame_indices is not None and frame_indices.shape[0] > 0
                     else (int(timesteps[0]) if timesteps is not None and timesteps.shape[0] > 0 else None)
                 )
-                if ep_idx is None or step_idx is None:
+                if step_idx is None:
                     return None
-
-                ep_id = f"episode_{ep_idx:05d}"
 
                 # Option 1: load from tracks npy if requested
                 if cfg.use_pointcloud_from_tracks and tracks_root is not None:
-                    track_path = tracks_root / ep_id / cfg.tracking_tracks_filename
+                    track_path = tracks_root / episode_name / cfg.tracking_tracks_filename
                     if not track_path.exists():
+                        print(f'track path {track_path} does not exist')
                         return None
                     tracks = torch.from_numpy(np.load(track_path)).float()
                     if step_idx >= tracks.shape[0]:
+                        print(f'step index {step_idx} is greater than the number of tracks')
                         return None
                     pc = tracks[step_idx]
                 else:
                     # Option 2: load from on-disk pointcloud files
-                    pc_path = pc_root / ep_id / cfg.pointcloud_subdir / f"step_{step_idx:04d}{cfg.pointcloud_ext}"
+                    pc_path = pc_root / episode_name / cfg.pointcloud_subdir / f"step_{step_idx:04d}{cfg.pointcloud_ext}"
                     if not pc_path.exists():
+                        print(f'pc path {pc_path} does not exist')
                         return None
                     pc_o3d = o3d.io.read_point_cloud(str(pc_path))
                     pc = torch.from_numpy(np.asarray(pc_o3d.points)).float()
@@ -1295,24 +1484,30 @@ def finetune(cfg: FinetuneConfig) -> None:
             traj_indices = obs.get("traj_index")
             frame_indices = obs.get("frame_index")
             timesteps = obs.get("timestep")
+            traj_lens = obs.get("traj_len")
+            episode_name = rlds_batch.get("episode_name").decode("utf-8")
 
-            ep_idx = int(traj_indices[0]) if traj_indices is not None and traj_indices.shape[0] > 0 else None
             step_idx = (
                 int(frame_indices[0])
                 if frame_indices is not None and frame_indices.shape[0] > 0
                 else (int(timesteps[0]) if timesteps is not None and timesteps.shape[0] > 0 else None)
             )
-            if ep_idx is None or step_idx is None:
+            if step_idx is None:
                 return None
 
-            ep_id = f"episode_{ep_idx:05d}"
-            track_path = tracks_root / ep_id / cfg.tracking_tracks_filename
+            track_path = tracks_root / episode_name / cfg.tracking_tracks_filename
             if not track_path.exists():
+                print(f'track path {track_path} does not exist')
                 return None
             tracks = torch.from_numpy(np.load(track_path)).float()
-            if step_idx >= tracks.shape[0]:
+            if traj_lens != tracks.shape[0]:
+                print(f'episode {episode_name} has {traj_lens} actions, but {tracks.shape[0]} tracks')
                 return None
-            pc = tracks[step_idx]
+            if step_idx - 1 < 0:
+                print(f'step index {step_idx} is less than 0, using first track')
+                pc = tracks[0]
+            else :
+                pc = tracks[step_idx - 1]
             max_points = pointcloud_input_num_points
             dim = cfg.pointcloud_input_dim if cfg.pointcloud_input_dim > 0 else None
             return pad_or_trim_pointcloud(pc, max_points, dim)
@@ -1345,6 +1540,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             frame_indices = obs.get("frame_index")
             timesteps = obs.get("timestep")
             traj_lens = obs.get("traj_len")
+            action_chunk = rlds_batch.get("action_chunk_indices_raw")
+            action_chunk_clip = rlds_batch.get("action_chunk_indices")
+            episode_name = rlds_batch.get("episode_name").decode("utf-8")
 
             chunk_len = rlds_batch["action"].shape[0]
 
@@ -1356,42 +1554,79 @@ def finetune(cfg: FinetuneConfig) -> None:
             )
             traj_len_anchor = int(traj_lens[0]) if traj_lens is not None and traj_lens.shape[0] > 0 else None
 
-            if ep_idx_anchor is None or step_idx_anchor is None:
+            if step_idx_anchor is None:
                 return None
 
-            ep_id = f"episode_{ep_idx_anchor:05d}"
-            track_path = tracks_root / ep_id / cfg.tracking_tracks_filename
+            track_path = tracks_root / episode_name / cfg.tracking_tracks_filename
+
             if not track_path.exists():
+                print(f'track path {track_path} does not exist')
                 return None
-
             tracks = torch.from_numpy(np.load(track_path)).float()  # (T, num_points, dim)
+            if traj_lens != tracks.shape[0]:
+                print(f'episode {episode_name} has {traj_lens} actions, but {tracks.shape[0]} tracks')
+                return None
 
             deltas = []
             tracks_len = tracks.shape[0]
             for i in range(chunk_len):
                 t = step_idx_anchor + i
-                if t + 1 < tracks_len:
-                    delta = tracks[t + 1] - tracks[t]
+                if t < tracks_len:
+                    if t - 1 < 0:
+                        # print(f'step index {t} is less than 0, using first track')
+                        # delta = tracks[0]
+                        print(f'step index {t-1} is less than 0')
+                        return None
+                    else :
+                        delta = tracks[t] - tracks[t-1]
                     delta = pad_or_trim_tracking(delta, cfg.tracking_num_points, cfg.tracking_dim)
                     deltas.append(delta)
-                elif t + 1 < tracks_len + chunk_len // 2:
+                elif t < tracks_len + chunk_len // 2:
+                    print(f'padding with zeros for delta {t}')
                     delta = torch.zeros(cfg.tracking_num_points, cfg.tracking_dim, dtype=tracks.dtype)
                     deltas.append(delta)
                 else:
-                    print(f"Episode {ep_id} has only {tracks_len} track frames, but expected {t + 1}")
+                    print(f"Episode {episode_name} has only {tracks_len} track frames, but expected {t + 1}")
                     return None
 
             if len(deltas) == 0:
                 return None
 
-            # Optional length check
-            # if traj_len_anchor is not None and tracks.shape[0] != traj_len_anchor:
-            #     print(f"Episode {ep_id} has {tracks.shape[0]} track frames, but expected {traj_len_anchor}")
-            #     return None
-
             return torch.stack(deltas, dim=0)
 
         tracking_tracks_loader = tracking_tracks_loader_fn
+        if cfg.tracking_use_point_features and cfg.use_pointcloud_from_tracks:
+            def tracking_pointcloud_loader_fn(rlds_batch):
+                obs = rlds_batch.get("observation", {})
+                traj_indices = obs.get("traj_index")
+                frame_indices = obs.get("frame_index")
+                timesteps = obs.get("timestep")
+                traj_lens = obs.get("traj_len")
+                episode_name = rlds_batch.get("episode_name").decode("utf-8")
+
+                step_idx_anchor = (
+                    int(frame_indices[0])
+                    if frame_indices is not None and frame_indices.shape[0] > 0
+                    else (int(timesteps[0]) if timesteps is not None and timesteps.shape[0] > 0 else None)
+                )
+                if step_idx_anchor is None:
+                    return None
+
+                track_path = tracks_root / episode_name / cfg.tracking_tracks_filename
+                
+                if not track_path.exists():
+                    print(f'track path {track_path} does not exist')
+                    return None
+                tracks = torch.from_numpy(np.load(track_path)).float()  # (T, num_points, dim)
+                if traj_lens != tracks.shape[0]:
+                    print(f'episode {episode_name} has {traj_lens} actions, but {tracks.shape[0]} tracks')
+                    return None
+                base_idx = step_idx_anchor - 1 if step_idx_anchor - 1 >= 0 else 0
+                base_pc = tracks[base_idx]
+                base_pc = pad_or_trim_tracking(base_pc, cfg.tracking_num_points, cfg.tracking_dim)
+                return base_pc
+
+            tracking_pointcloud_loader = tracking_pointcloud_loader_fn
 
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(
@@ -1408,6 +1643,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         tracking_from_disk_fn=tracking_tracks_loader if cfg.tracking_tracks_root is not None else pointcloud_loader,
         tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
         tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
+        tracking_pointcloud_fn=tracking_pointcloud_loader if (cfg.tracking_use_point_features and cfg.use_pointcloud_from_tracks) else None,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1475,9 +1711,18 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            capture_tracking = (
+                cfg.use_tracking_head
+                and cfg.save_tracking_viz
+                and distributed_state.is_main_process
+                and ((batch_idx + 1) % cfg.grad_accumulation_steps == 0)
+                and (log_step % cfg.tracking_viz_freq == 0)
+            )
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
-            loss, metrics = run_forward_pass(
+            loss, metrics, tracking_debug = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
@@ -1497,6 +1742,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 tracking_loss_weight=cfg.tracking_loss_weight,
+                capture_tracking=capture_tracking,
+                tracking_use_point_features=cfg.tracking_use_point_features,
+                tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+                tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
+                tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1510,14 +1760,20 @@ def finetune(cfg: FinetuneConfig) -> None:
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
+            if tracking_debug is not None:
+                viz_dir = cfg.tracking_viz_dir if cfg.tracking_viz_dir is not None else run_dir / "tracking_viz"
+                save_tracking_visualizations(
+                    tracking_debug,
+                    viz_dir,
+                    log_step,
+                    tracking_labels_are_deltas=cfg.tracking_tracks_root is not None,
+                    max_points=cfg.tracking_viz_max_points,
+                )
+
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 if cfg.use_wandb:
                     log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)

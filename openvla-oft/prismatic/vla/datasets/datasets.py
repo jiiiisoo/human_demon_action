@@ -48,6 +48,7 @@ class RLDSBatchTransform:
     tracking_from_disk_fn: Optional[Callable[[Dict[str, Any]], Any]] = None
     tracking_num_points: Optional[int] = None
     tracking_dim: Optional[int] = None
+    tracking_pointcloud_fn: Optional[Callable[[Dict[str, Any]], Any]] = None
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -142,6 +143,14 @@ class RLDSBatchTransform:
         elif self.tracking_key is not None:
             tracking_value = _get_nested_value(rlds_batch, self.tracking_key)
             return_dict["tracking"] = torch.as_tensor(np.array(tracking_value), dtype=torch.float32)
+        if self.tracking_pointcloud_fn is not None:
+            tracking_pointcloud_value = self.tracking_pointcloud_fn(rlds_batch)
+            if tracking_pointcloud_value is not None:
+                if isinstance(tracking_pointcloud_value, torch.Tensor):
+                    tracking_pointcloud_tensor = tracking_pointcloud_value.float()
+                else:
+                    tracking_pointcloud_tensor = torch.as_tensor(np.array(tracking_pointcloud_value), dtype=torch.float32)
+                return_dict["tracking_pointcloud"] = tracking_pointcloud_tensor
 
         return return_dict
 

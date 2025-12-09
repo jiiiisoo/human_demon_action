@@ -167,6 +167,17 @@ class PaddedCollatorForActionPrediction:
         else:
             tracking = None
 
+        tracking_pointcloud = None
+        if "tracking_pointcloud" in instances[0]:
+            tracking_pc_list = []
+            for instance in instances:
+                pc_tensor = instance["tracking_pointcloud"]
+                pc_tensor = pc_tensor if isinstance(pc_tensor, torch.Tensor) else torch.from_numpy(
+                    np.array(pc_tensor)
+                )
+                tracking_pc_list.append(pc_tensor)
+            tracking_pointcloud = torch.stack(tracking_pc_list).to(torch.float32)
+
         output = dict(
             pixel_values=pixel_values,
             proprio=proprio,
@@ -181,4 +192,6 @@ class PaddedCollatorForActionPrediction:
             output["tracking"] = tracking
         if pointcloud is not None:
             output["pointcloud"] = pointcloud
+        if tracking_pointcloud is not None:
+            output["tracking_pointcloud"] = tracking_pointcloud
         return output
