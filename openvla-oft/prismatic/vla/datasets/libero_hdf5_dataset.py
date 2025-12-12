@@ -147,7 +147,6 @@ class LIBEROBatchTransform:
         # Note: pointcloud is needed for BOTH VLA input and tracking head input
         if "pointcloud" in libero_batch:
             pointcloud = libero_batch["pointcloud"]
-            print(f'shape of pointcloud: {pointcloud.shape}')
             if pointcloud is not None:
                 if isinstance(pointcloud, torch.Tensor):
                     pointcloud_tensor = pointcloud.float()
@@ -158,7 +157,6 @@ class LIBEROBatchTransform:
         # Add tracking deltas if available and requested
         if "tracking" in libero_batch:
             tracking = libero_batch["tracking"]
-            print(f'shape of tracking: {tracking.shape}')
             if tracking is not None:
                 if isinstance(tracking, torch.Tensor):
                     tracking_tensor = tracking.float()
@@ -472,6 +470,54 @@ class LIBEROHdf5Dataset(Dataset):
             self.task_suite: stats_data
         }
         
+    def normalize_action(self, action: np.ndarray) -> np.ndarray:
+        """
+        Normalize action using BOUNDS_Q99 method (same as RLDS).
+        Maps [q01, q99] -> [-1, 1]
+        
+        Args:
+            action: np.ndarray of shape (action_dim,) or (chunk_size, action_dim)
+        
+        Returns:
+            Normalized action of same shape
+        """
+        if "action" not in self._statistics_data:
+            return action
+        
+        q01 = np.array(self._statistics_data["action"]["q01"])
+        q99 = np.array(self._statistics_data["action"]["q99"])
+        
+        # BOUNDS_Q99: [q01, q99] -> [-1, 1]
+        # normalized = 2 * (action - q01) / (q99 - q01) - 1
+        normalized = 2.0 * (action - q01) / (q99 - q01 + 1e-8) - 1.0
+        
+        # Clip to [-1, 1] for safety
+        normalized = np.clip(normalized, -1.0, 1.0)
+        
+        return normalized
+    
+    def denormalize_action(self, action: np.ndarray) -> np.ndarray:
+        """
+        Denormalize action from [-1, 1] back to original scale.
+        
+        Args:
+            action: np.ndarray of shape (action_dim,) or (chunk_size, action_dim)
+        
+        Returns:
+            Denormalized action of same shape
+        """
+        if "action" not in self._statistics_data:
+            return action
+        
+        q01 = np.array(self._statistics_data["action"]["q01"])
+        q99 = np.array(self._statistics_data["action"]["q99"])
+        
+        # Inverse of BOUNDS_Q99
+        # denormalized = (normalized + 1) * (q99 - q01) / 2 + q01
+        denormalized = (action + 1.0) * (q99 - q01) / 2.0 + q01
+        
+        return denormalized
+        
     def normalize_pointcloud(self, pointcloud: np.ndarray) -> np.ndarray:
         """
         Normalize pointcloud using dataset statistics (x, y, z separately).
@@ -691,6 +737,11 @@ class LIBEROHdf5Dataset(Dataset):
         
         # Apply normalization BEFORE batch transform
         # This way we normalize the raw numpy data before tensorization
+        
+        # Normalize actions using BOUNDS_Q99 (same as RLDS)
+        if "action" in frame_data:
+            frame_data["action"] = self.normalize_action(frame_data["action"])
+        
         if self.should_normalize_pointcloud and "pointcloud" in frame_data:
             pc = frame_data["pointcloud"]
             if pc is not None:
