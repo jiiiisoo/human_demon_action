@@ -188,6 +188,7 @@ class LIBEROHdf5Dataset(Dataset):
         use_wrist_image: bool = False,
         tracking_tracks_root: Optional[Path] = None,
         action_chunk_size: int = 1,
+        window_stride: int = 1,
         seed: int = 42,
         normalize_pointcloud: bool = True,
         normalize_tracking: bool = True,
@@ -205,6 +206,7 @@ class LIBEROHdf5Dataset(Dataset):
             use_wrist_image: Whether to use wrist camera images
             tracking_tracks_root: Root directory for tracking data (pointcloud + tracking deltas)
             action_chunk_size: Number of future actions to include (for action chunking)
+            window_stride: Stride for sampling frames (1 = all frames, >1 = skip frames for less overlap)
             seed: Random seed for shuffling
             normalize_pointcloud: If True, normalize pointcloud input using dataset statistics (x, y, z separately)
             normalize_tracking: If True, normalize tracking data using dataset statistics (x, y, z separately)
@@ -220,6 +222,7 @@ class LIBEROHdf5Dataset(Dataset):
         self.use_wrist_image = use_wrist_image
         self.tracking_tracks_root = Path(tracking_tracks_root) if tracking_tracks_root else None
         self.action_chunk_size = action_chunk_size
+        self.window_stride = window_stride
         self.seed = seed
         self.should_normalize_pointcloud = normalize_pointcloud
         self.should_normalize_tracking = normalize_tracking
@@ -236,6 +239,7 @@ class LIBEROHdf5Dataset(Dataset):
         print(f"  Image resolution: {resize_resolution}")
         print(f"  Wrist camera: {use_wrist_image}")
         print(f"  Action chunk size: {action_chunk_size}")
+        print(f"  Window stride: {window_stride}")
         
         # Build index of all episodes
         self._build_episode_index()
@@ -310,6 +314,7 @@ class LIBEROHdf5Dataset(Dataset):
         
         Note: We exclude the last (action_chunk_size - 1) frames from each episode
         to ensure we can always load a complete action chunk without padding.
+        Window stride controls the sampling density (1 = all frames, >1 = skip frames).
         """
         self.frame_index = []  # List of (episode_idx, frame_idx) tuples
         
@@ -318,13 +323,14 @@ class LIBEROHdf5Dataset(Dataset):
             # Valid frame_idx: 0 <= frame_idx <= num_frames - action_chunk_size
             max_valid_frame_idx = max(0, ep_info["num_frames"] - self.action_chunk_size)
             
-            for frame_idx in range(max_valid_frame_idx):
+            # Sample frames with stride
+            for frame_idx in range(0, max_valid_frame_idx, self.window_stride):
                 self.frame_index.append((ep_idx, frame_idx))
         
         # Update dataset_length to actual number of valid samples
         self.dataset_length = len(self.frame_index)
         
-        print(f"  Built frame index: {len(self.frame_index)} frames")
+        print(f"  Built frame index: {len(self.frame_index)} frames (stride={self.window_stride})")
         print(f"  (Excluded last {self.action_chunk_size - 1} frames per episode for action chunking)")
         
     def _compute_statistics(self):
@@ -589,6 +595,8 @@ class LIBEROHdf5Dataset(Dataset):
         
         pc_mean = np.array(self._statistics_data["pointcloud"]["mean"])
         pc_std = np.array(self._statistics_data["pointcloud"]["std"])
+
+        pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
         
         denormalized = pointcloud.copy()
         denormalized[:, :3] = pointcloud[:, :3] * pc_std + pc_mean
@@ -610,6 +618,8 @@ class LIBEROHdf5Dataset(Dataset):
         
         track_mean = np.array(self._statistics_data["tracking"]["mean"])
         track_std = np.array(self._statistics_data["tracking"]["std"])
+
+        track_std = np.where(track_std < 1e-6, 1.0, track_std)
         
         if len(tracking.shape) == 2:
             denormalized = tracking * track_std + track_mean
@@ -739,18 +749,17 @@ class LIBEROHdf5Dataset(Dataset):
         # This way we normalize the raw numpy data before tensorization
         
         # Normalize actions using BOUNDS_Q99 (same as RLDS)
-        if "action" in frame_data:
-            frame_data["action"] = self.normalize_action(frame_data["action"])
+        frame_data["action"] = self.normalize_action(frame_data["action"])
         
-        if self.should_normalize_pointcloud and "pointcloud" in frame_data:
-            pc = frame_data["pointcloud"]
-            if pc is not None:
-                frame_data["pointcloud"] = self.normalize_pointcloud(pc)
+        # if self.should_normalize_pointcloud and "pointcloud" in frame_data:
+        pc = frame_data["pointcloud"]
+        # if pc is not None:
+        frame_data["pointcloud"] = self.normalize_pointcloud(pc)
         
-        if self.should_normalize_tracking and "tracking" in frame_data:
-            tracking = frame_data["tracking"]
-            if tracking is not None:
-                frame_data["tracking"] = self.normalize_tracking(tracking)
+        # if self.should_normalize_tracking and "tracking" in frame_data:
+        tracking = frame_data["tracking"]
+            # if tracking is not None:
+        frame_data["tracking"] = self.normalize_tracking(tracking)
         
         # Apply batch transform (converts to tensors)
         transformed = self.batch_transform(frame_data)
@@ -776,6 +785,7 @@ def make_libero_hdf5_datasets(
     use_wrist_image: bool = False,
     tracking_tracks_root: Optional[Path] = None,
     action_chunk_size: int = 1,
+    window_stride: int = 1,
     use_val_set: bool = False,
     val_ratio: float = 0.1,
     normalize_pointcloud: bool = True,
@@ -795,6 +805,7 @@ def make_libero_hdf5_datasets(
         use_wrist_image: Whether to use wrist camera
         tracking_tracks_root: Root directory for tracking data (pointcloud + tracking deltas)
         action_chunk_size: Number of future actions to include
+        window_stride: Stride for sampling frames (1 = all frames, >1 = skip frames)
         use_val_set: Whether to create validation set
         val_ratio: Ratio of data to use for validation
         normalize_pointcloud: Whether to normalize pointcloud input (x, y, z separately)
@@ -815,6 +826,7 @@ def make_libero_hdf5_datasets(
         use_wrist_image=use_wrist_image,
         tracking_tracks_root=tracking_tracks_root,
         action_chunk_size=action_chunk_size,
+        window_stride=window_stride,
         seed=42,
         normalize_pointcloud=normalize_pointcloud,
         normalize_tracking=normalize_tracking,
@@ -834,6 +846,7 @@ def make_libero_hdf5_datasets(
             use_wrist_image=use_wrist_image,
             tracking_tracks_root=tracking_tracks_root,
             action_chunk_size=action_chunk_size,
+            window_stride=window_stride,
             seed=123,
             normalize_pointcloud=normalize_pointcloud,
             normalize_tracking=normalize_tracking,
@@ -859,7 +872,7 @@ if __name__ == "__main__":
         task_suite="libero_goal",
         batch_transform=DummyBatchTransform(),
         resize_resolution=(256, 256),
-        shuffle_buffer_size=1000,
+        shuffle_buffer_size=10000,
         train=True,
         image_aug=False,
     )
