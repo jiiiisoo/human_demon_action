@@ -532,18 +532,24 @@ def run_forward_pass(
             if capture_tracking:
                 if pointcloud_input is not None and train_dataset is not None:
                     # Denormalize for visualization in real 3D space
-                    pc_norm = pointcloud_input[:1].detach().to(torch.float32).cpu().numpy()
-                    tracking_labels_norm = tracking_labels[:1].detach().to(torch.float32).cpu().numpy()
-                    predicted_tracking_norm = predicted_tracking[:1].detach().to(torch.float32).cpu().numpy()
-                    
+                    # Remove batch dimension [0] instead of [:1] to match expected shapes
+                    pc_norm = pointcloud_input[0].detach().to(torch.float32).cpu().numpy()  # (num_points, 3)
+                    tracking_labels_norm = tracking_labels[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3)
+                    predicted_tracking_norm = predicted_tracking[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3)
+                    print(f"pc_norm shape: {pc_norm.shape}")
+                    print(f"tracking_labels_norm shape: {tracking_labels_norm.shape}")
+                    print(f"predicted_tracking_norm shape: {predicted_tracking_norm.shape}")
+                    # denormalize_pointcloud expects (num_points, 3)
+                    # denormalize_tracking expects (T, num_points, 3)
                     pc_denorm = train_dataset.denormalize_pointcloud(pc_norm)
                     tracking_labels_denorm = train_dataset.denormalize_tracking(tracking_labels_norm)
                     predicted_tracking_denorm = train_dataset.denormalize_tracking(predicted_tracking_norm)
                     
+                    # Add batch dimension back for tracking_debug_data
                     tracking_debug_data = {
-                        "predicted_tracking": torch.from_numpy(predicted_tracking_denorm),
-                        "tracking_labels": torch.from_numpy(tracking_labels_denorm),
-                        "pointcloud_input": torch.from_numpy(pc_denorm),
+                        "predicted_tracking": torch.from_numpy(predicted_tracking_denorm).unsqueeze(0),
+                        "tracking_labels": torch.from_numpy(tracking_labels_denorm).unsqueeze(0),
+                        "pointcloud_input": torch.from_numpy(pc_denorm).unsqueeze(0),
                     }
             if tracking_labels.shape[1] >= 1:
                 ground_truth_curr_tracking = tracking_labels[:, 0]
@@ -733,22 +739,43 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
     if points_seq.size == 0:
         return
     video_path = Path(video_path)
+    print(f"video_path: {video_path}")
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    fig = plt.figure(figsize=(6, 6))
+    fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection="3d")
-    ax.set_axis_off()
-    pts_all = points_seq.reshape(-1, 3)
-    pts_all = pts_all - pts_all.mean(axis=0, keepdims=True)
-    max_range = np.linalg.norm(pts_all, axis=1).max() + 1e-6
+    
+    # Use first frame as reference for centering (shows delta movements clearly)
+    first_frame = points_seq[0]  # (num_points, 3)
+    first_frame_center = first_frame.mean(axis=0, keepdims=True)  # (1, 3)
+    
+    # Compute max range based on first frame for fixed view
+    first_frame_centered = first_frame - first_frame_center
+    max_range = np.linalg.norm(first_frame_centered, axis=1).max() + 1e-6
+    
+    # Add margin to show movement
+    max_range *= 1.5
+    
     ax.set_xlim3d([-max_range, max_range])
     ax.set_ylim3d([-max_range, max_range])
     ax.set_zlim3d([-max_range, max_range])
-    scatter = ax.scatter([], [], [], s=1)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    
+    scatter = ax.scatter([], [], [], c='blue', marker='o', s=5, alpha=0.6)
     writer = imageio.get_writer(video_path, fps=fps)
-    for pts in points_seq:
-        pts = pts - pts.mean(axis=0, keepdims=True)
+    
+    T = len(points_seq)
+    for frame_idx, pts in enumerate(points_seq):
+        # Center all frames relative to first frame's center
+        # This shows delta movements from the initial position
+        pts_centered = pts - first_frame_center
         ax.view_init(elev=20.0, azim=45.0)
-        scatter._offsets3d = (pts[:, 0], pts[:, 1], pts[:, 2])
+        scatter._offsets3d = (pts_centered[:, 0], pts_centered[:, 1], pts_centered[:, 2])
+        
+        # Update title with frame counter
+        ax.set_title(f'Point Tracking Trajectory (Frame {frame_idx}/{T-1})')
+        
         fig.canvas.draw()
         frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
         writer.append_data(frame)
