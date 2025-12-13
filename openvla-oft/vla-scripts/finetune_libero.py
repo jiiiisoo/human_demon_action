@@ -94,6 +94,8 @@ class FinetuneConfig:
     dataset_name: str = "libero"                     # [Not used for LIBERO] Name of fine-tuning dataset
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    window_stride: int = 1                           # Stride for sampling frames (1 = all frames, >1 = skip frames for less overlap)
+    action_chunk_size: Optional[int] = None          # Number of actions in chunk (None = use default from constants.py)
     tracking_tracks_root: Optional[Path] = None      # Root directory for tracking data (pointcloud + tracking deltas)
     tracking_tracks_filename: str = "vertex_tracks_face_uniform.npy"  # Track filename under each episode dir
     precomputed_statistics_path: Optional[Path] = None  # Path to precomputed statistics JSON file
@@ -536,9 +538,6 @@ def run_forward_pass(
                     pc_norm = pointcloud_input[0].detach().to(torch.float32).cpu().numpy()  # (num_points, 3)
                     tracking_labels_norm = tracking_labels[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3)
                     predicted_tracking_norm = predicted_tracking[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3)
-                    print(f"pc_norm shape: {pc_norm.shape}")
-                    print(f"tracking_labels_norm shape: {tracking_labels_norm.shape}")
-                    print(f"predicted_tracking_norm shape: {predicted_tracking_norm.shape}")
                     # denormalize_pointcloud expects (num_points, 3)
                     # denormalize_tracking expects (T, num_points, 3)
                     pc_denorm = train_dataset.denormalize_pointcloud(pc_norm)
@@ -1145,6 +1144,25 @@ def finetune(cfg: FinetuneConfig) -> None:
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
+    # Override NUM_ACTIONS_CHUNK if specified via command line
+    global NUM_ACTIONS_CHUNK
+    if cfg.action_chunk_size is not None:
+        if cfg.resume:
+            raise ValueError(
+                "Cannot change action_chunk_size when resuming from checkpoint. "
+                "The checkpoint was trained with a specific action_chunk_size and cannot be changed."
+            )
+        
+        print(f"Overriding NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK} -> {cfg.action_chunk_size}")
+        NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+        
+        # Update the constant in all relevant modules
+        import prismatic.vla.constants as constants_module
+        constants_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+        
+        import prismatic.models.action_heads as action_heads_module
+        action_heads_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+    
     # Print detected constants
     print(
         "Detected constants:\n"
@@ -1389,6 +1407,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_wrist_image=use_wrist_image,
         tracking_tracks_root=cfg.tracking_tracks_root,
         action_chunk_size=NUM_ACTIONS_CHUNK,
+        window_stride=cfg.window_stride,
         use_val_set=cfg.use_val_set,
         normalize_pointcloud=cfg.normalize_pointcloud,
         normalize_tracking=cfg.normalize_tracking,
