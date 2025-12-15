@@ -193,6 +193,7 @@ class LIBEROHdf5Dataset(Dataset):
         normalize_pointcloud: bool = True,
         normalize_tracking: bool = True,
         precomputed_statistics_path: Optional[Path] = None,
+        filename: str = "vertex_tracks_face_uniform.npy",
     ) -> None:
         """
         Args:
@@ -227,6 +228,7 @@ class LIBEROHdf5Dataset(Dataset):
         self.should_normalize_pointcloud = normalize_pointcloud
         self.should_normalize_tracking = normalize_tracking
         self.precomputed_statistics_path = Path(precomputed_statistics_path) if precomputed_statistics_path else None
+        self.filename = filename
         
         # Find all HDF5 files in the directory
         self.hdf5_files = sorted(glob.glob(str(self.data_dir / "*_demo.hdf5")))
@@ -358,7 +360,7 @@ class LIBEROHdf5Dataset(Dataset):
             
             # Load ALL tracking data from tracking file
             if self.tracking_tracks_root and ep_info["point_cloud_id"]:
-                track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / "vertex_tracks_face_uniform.npy"
+                track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / self.filename
                 if track_file.exists():
                     try:
                         tracks = np.load(track_file)  # (T, num_points, 3)
@@ -684,7 +686,7 @@ class LIBEROHdf5Dataset(Dataset):
         tracking_deltas = None
         
         if self.tracking_tracks_root and ep_info["point_cloud_id"]:
-            track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / "vertex_tracks_face_uniform.npy"
+            track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / self.filename
             if track_file.exists():
                 tracks = np.load(track_file)  # (T, num_points, 3)
                 
@@ -791,6 +793,7 @@ def make_libero_hdf5_datasets(
     normalize_pointcloud: bool = True,
     normalize_tracking: bool = True,
     precomputed_statistics_path: Optional[Path] = None,
+    filename: str = "vertex_tracks_face_uniform.npy",
 ) -> Tuple[LIBEROHdf5Dataset, Optional[LIBEROHdf5Dataset]]:
     """
     Create train and (optionally) validation datasets from LIBERO HDF5 files.
@@ -831,6 +834,7 @@ def make_libero_hdf5_datasets(
         normalize_pointcloud=normalize_pointcloud,
         normalize_tracking=normalize_tracking,
         precomputed_statistics_path=precomputed_statistics_path,
+        filename=filename,
     )
     
     val_dataset = None
@@ -851,6 +855,7 @@ def make_libero_hdf5_datasets(
             normalize_pointcloud=normalize_pointcloud,
             normalize_tracking=normalize_tracking,
             precomputed_statistics_path=precomputed_statistics_path,
+            filename=filename,
         )
     
     return train_dataset, val_dataset
