@@ -142,6 +142,8 @@ class FinetuneConfig:
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume_checkpoint_dir: Optional[str] = None      # (When `resume==True`) Path to checkpoint directory (if not specified, uses vla_path)
+    base_model_path: Optional[str] = None            # (When `resume==True`) Path to base model (if not specified, infers from checkpoint or uses default)
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -207,7 +209,8 @@ def get_run_id(cfg) -> str:
         run_id = cfg.run_id_override
     elif cfg.resume:
         # Override run ID with the previous resumed run's ID
-        run_id = cfg.vla_path.split("/")[-1]
+        checkpoint_path = cfg.resume_checkpoint_dir if cfg.resume_checkpoint_dir else cfg.vla_path
+        run_id = Path(checkpoint_path).name
         # Remove the "--XXX_chkpt" suffix from the run ID if it exists
         if "chkpt" in run_id.split("--")[-1]:
             run_id = "--".join(run_id.split("--")[:-1])
@@ -281,6 +284,7 @@ def init_module(
     cfg: FinetuneConfig,
     device_id: int,
     module_args: dict,
+    checkpoint_dir: Optional[Path] = None,
     to_bf16: bool = False,
     find_unused_params: bool = False,
 ) -> DDP:
@@ -302,8 +306,8 @@ def init_module(
     module = module_class(**module_args)
     count_parameters(module, module_name)
 
-    if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+    if cfg.resume and checkpoint_dir is not None:
+        state_dict = load_checkpoint(module_name, str(checkpoint_dir), cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -696,6 +700,21 @@ def _ensure_tracking_viz_deps():
     return False
 
 
+def _cleanup_matplotlib_resources():
+    """Clean up matplotlib resources to prevent memory leaks."""
+    if plt is not None:
+        try:
+            plt.close('all')
+            # Force garbage collection of matplotlib figures
+            import gc
+            gc.collect()
+            # Also clear CUDA cache if available to prevent memory buildup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
+
+
 def _pad_or_trim_base_np(base_pc: Optional[np.ndarray], num_points: int, dim: int) -> np.ndarray:
     if base_pc is None:
         base_pc = np.zeros((num_points, dim), dtype=np.float32)
@@ -732,54 +751,88 @@ def _downsample_sequence_points(sequence: np.ndarray, max_points: Optional[int])
     return sequence[:, :max_points]
 
 
-def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps: int = 5) -> None:
+def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps: int = 5, max_frames: int = 20) -> None:
+    """Save tracking video with aggressive optimizations to minimize rendering time."""
     if not _ensure_tracking_viz_deps():
         return
     if points_seq.size == 0:
         return
+    
     video_path = Path(video_path)
     print(f"video_path: {video_path}")
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection="3d")
     
-    # Use first frame as reference for centering (shows delta movements clearly)
-    first_frame = points_seq[0]  # (num_points, 3)
-    first_frame_center = first_frame.mean(axis=0, keepdims=True)  # (1, 3)
-    
-    # Compute max range based on first frame for fixed view
-    first_frame_centered = first_frame - first_frame_center
-    max_range = np.linalg.norm(first_frame_centered, axis=1).max() + 1e-6
-    
-    # Add margin to show movement
-    max_range *= 1.5
-    
-    ax.set_xlim3d([-max_range, max_range])
-    ax.set_ylim3d([-max_range, max_range])
-    ax.set_zlim3d([-max_range, max_range])
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    
-    scatter = ax.scatter([], [], [], c='blue', marker='o', s=5, alpha=0.6)
-    writer = imageio.get_writer(video_path, fps=fps)
-    
-    T = len(points_seq)
-    for frame_idx, pts in enumerate(points_seq):
-        # Center all frames relative to first frame's center
-        # This shows delta movements from the initial position
-        pts_centered = pts - first_frame_center
-        ax.view_init(elev=20.0, azim=45.0)
-        scatter._offsets3d = (pts_centered[:, 0], pts_centered[:, 1], pts_centered[:, 2])
+    fig = None
+    writer = None
+    try:
+        import time
+        start_time = time.time()
         
-        # Update title with frame counter
-        ax.set_title(f'Point Tracking Trajectory (Frame {frame_idx}/{T-1})')
+        # Aggressive size reduction: smaller figure = faster rendering
+        # Use size divisible by 16 to avoid ffmpeg warnings
+        fig = plt.figure(figsize=(4.8, 4.8), dpi=80)  # Results in 384x384 pixels (divisible by 16)
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_axis_off()  # Remove axes for faster rendering
         
-        fig.canvas.draw()
-        frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
-        writer.append_data(frame)
-    writer.close()
-    plt.close(fig)
+        # Use first frame as reference for centering (shows delta movements clearly)
+        first_frame = points_seq[0]  # (num_points, 3)
+        first_frame_center = first_frame.mean(axis=0, keepdims=True)  # (1, 3)
+        
+        # Compute max range based on first frame for fixed view
+        first_frame_centered = first_frame - first_frame_center
+        max_range = np.linalg.norm(first_frame_centered, axis=1).max() + 1e-6
+        
+        # Add margin to show movement
+        max_range *= 1.5
+        
+        ax.set_xlim3d([-max_range, max_range])
+        ax.set_ylim3d([-max_range, max_range])
+        ax.set_zlim3d([-max_range, max_range])
+        
+        T = len(points_seq)
+        # Aggressively limit number of frames (20 instead of 50)
+        if T > max_frames:
+            # Sample evenly across the sequence
+            frame_indices = np.linspace(0, T-1, max_frames, dtype=int)
+            print(f"Limiting frames from {T} to {max_frames} for faster rendering")
+        else:
+            frame_indices = range(T)
+        
+        scatter = ax.scatter([], [], [], c='blue', marker='o', s=3, alpha=0.5)  # Smaller, more transparent points
+        writer = imageio.get_writer(video_path, fps=fps, quality=7)  # Lower quality for faster encoding
+        
+        for idx, frame_idx in enumerate(frame_indices):
+            pts = points_seq[frame_idx]
+            
+            # Center all frames relative to first frame's center
+            # Render all points without downsampling
+            pts_centered = pts - first_frame_center
+            ax.view_init(elev=20.0, azim=45.0)
+            scatter._offsets3d = (pts_centered[:, 0], pts_centered[:, 1], pts_centered[:, 2])
+            
+            fig.canvas.draw()
+            frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+            writer.append_data(frame)
+        
+        writer.close()
+        elapsed = time.time() - start_time
+        print(f"Successfully saved tracking video to {video_path} (took {elapsed:.2f}s)")
+    except Exception as e:
+        print(f"WARNING: Failed to save tracking video to {video_path}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Ensure resources are cleaned up even if an error occurs
+        if writer is not None:
+            try:
+                writer.close()
+            except:
+                pass
+        if fig is not None:
+            try:
+                plt.close(fig)
+            except:
+                pass
 
 
 def save_tracking_visualizations(
@@ -789,23 +842,36 @@ def save_tracking_visualizations(
     tracking_labels_are_deltas: bool,
     max_points: Optional[int],
 ) -> None:
+    """Save tracking visualizations with error handling to prevent training interruption."""
     if not _ensure_tracking_viz_deps():
         return
-    pred = tracking_debug.get("predicted_tracking")
-    gt = tracking_debug.get("tracking_labels")
-    base_pc = tracking_debug.get("pointcloud_input")
-    if pred is None or gt is None:
-        return
-    pred_np = pred[0].to(torch.float32).cpu().numpy()
-    gt_np = gt[0].to(torch.float32).cpu().numpy()
-    base_np = base_pc[0].to(torch.float32).cpu().numpy() if base_pc is not None else None
-    pred_seq = _build_tracking_sequence(base_np, pred_np, treat_as_delta=tracking_labels_are_deltas)
-    gt_seq = _build_tracking_sequence(base_np, gt_np, treat_as_delta=tracking_labels_are_deltas)
-    pred_seq = _downsample_sequence_points(pred_seq, max_points)
-    gt_seq = _downsample_sequence_points(gt_seq, max_points)
-    output_dir = Path(output_dir)
-    _save_tracking_sequence_video(pred_seq, output_dir / f"tracking_pred_step_{log_step:06d}.mp4")
-    _save_tracking_sequence_video(gt_seq, output_dir / f"tracking_gt_step_{log_step:06d}.mp4")
+    
+    try:
+        pred = tracking_debug.get("predicted_tracking")
+        gt = tracking_debug.get("tracking_labels")
+        base_pc = tracking_debug.get("pointcloud_input")
+        if pred is None or gt is None:
+            return
+        pred_np = pred[0].to(torch.float32).cpu().numpy()
+        gt_np = gt[0].to(torch.float32).cpu().numpy()
+        base_np = base_pc[0].to(torch.float32).cpu().numpy() if base_pc is not None else None
+        pred_seq = _build_tracking_sequence(base_np, pred_np, treat_as_delta=tracking_labels_are_deltas)
+        gt_seq = _build_tracking_sequence(base_np, gt_np, treat_as_delta=tracking_labels_are_deltas)
+        pred_seq = _downsample_sequence_points(pred_seq, max_points)
+        gt_seq = _downsample_sequence_points(gt_seq, max_points)
+        output_dir = Path(output_dir)
+        _save_tracking_sequence_video(pred_seq, output_dir / f"tracking_pred_step_{log_step:06d}.mp4")
+        _save_tracking_sequence_video(gt_seq, output_dir / f"tracking_gt_step_{log_step:06d}.mp4")
+        # Clean up matplotlib resources after visualization
+        _cleanup_matplotlib_resources()
+    except Exception as e:
+        print(f"WARNING: Failed to save tracking visualizations at step {log_step}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Continue training even if visualization fails
+    finally:
+        # Ensure cleanup even if error occurs
+        _cleanup_matplotlib_resources()
 
 
 def compute_smoothened_metrics(metrics_deques) -> dict:
@@ -876,6 +942,8 @@ def save_training_checkpoint(
     tracking_head,
     train_dataset,
     distributed_state,
+    optimizer=None,
+    scheduler=None,
 ) -> None:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
@@ -946,6 +1014,15 @@ def save_training_checkpoint(
         if cfg.use_tracking_head and tracking_head is not None:
             torch.save(tracking_head.state_dict(), checkpoint_dir / f"tracking_head--{checkpoint_name_suffix}")
 
+        # Save optimizer and scheduler states
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), checkpoint_dir / f"optimizer--{checkpoint_name_suffix}")
+            print(f"Saved optimizer state for Step {log_step}")
+        
+        if scheduler is not None:
+            torch.save(scheduler.state_dict(), checkpoint_dir / f"scheduler--{checkpoint_name_suffix}")
+            print(f"Saved scheduler state for Step {log_step}")
+
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
@@ -958,15 +1035,29 @@ def save_training_checkpoint(
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
-        base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-        )
-        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-        merged_vla = merged_vla.merge_and_unload()
+        try:
+            # Clear GPU cache before loading base model
+            torch.cuda.empty_cache()
+            
+            # Load base model on CPU to avoid OOM
+            print(f"Loading base model on CPU for merging (to avoid GPU OOM)...")
+            base_vla = AutoModelForVision2Seq.from_pretrained(
+                cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, 
+                trust_remote_code=True, device_map="cpu"
+            )
+            merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir, device_map="cpu")
+            merged_vla = merged_vla.merge_and_unload()
 
-        if distributed_state.is_main_process:
-            merged_vla.save_pretrained(checkpoint_dir)
-            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+            if distributed_state.is_main_process:
+                merged_vla.save_pretrained(checkpoint_dir)
+                print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+            
+            # Clean up
+            del base_vla, merged_vla
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"WARNING: Failed to merge LoRA weights during training: {e}")
+            print(f"LoRA adapter has been saved at {adapter_dir}. You can merge it offline later.")
 
         # Wait for merged model to be saved
         dist.barrier()
@@ -1131,7 +1222,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     distributed_state = PartialState()
     device_id = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
-    torch.cuda.empty_cache()
+    
+    # Aggressive cache clearing for resume (to avoid fragmentation)
+    if cfg.resume:
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device_id)
+        print(f"[GPU {device_id}] Cleared cache for resume")
+    else:
+        torch.cuda.empty_cache()
 
     # Initialize wandb logging
     if cfg.use_wandb and distributed_state.is_main_process:
@@ -1144,15 +1244,63 @@ def finetune(cfg: FinetuneConfig) -> None:
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
-    # Override NUM_ACTIONS_CHUNK if specified via command line
+    # Override NUM_ACTIONS_CHUNK if specified via command line or load from checkpoint
     global NUM_ACTIONS_CHUNK
-    if cfg.action_chunk_size is not None:
-        if cfg.resume:
-            raise ValueError(
-                "Cannot change action_chunk_size when resuming from checkpoint. "
-                "The checkpoint was trained with a specific action_chunk_size and cannot be changed."
-            )
+    
+    # If resuming, set up paths and load configuration from checkpoint
+    checkpoint_dir = None
+    if cfg.resume:
+        # Determine checkpoint directory
+        if cfg.resume_checkpoint_dir is not None:
+            checkpoint_dir = Path(cfg.resume_checkpoint_dir)
+        else:
+            # Legacy: vla_path points to checkpoint
+            checkpoint_dir = Path(cfg.vla_path)
         
+        # Load args_config.json from checkpoint
+        args_config_path = checkpoint_dir / "args_config.json"
+        if args_config_path.exists():
+            with open(args_config_path, "r") as f:
+                saved_args = json.load(f)
+                
+                # Load action_chunk_size
+                if "action_chunk_size" in saved_args and saved_args["action_chunk_size"] is not None:
+                    checkpoint_action_chunk_size = saved_args["action_chunk_size"]
+                    print(f"Loading action_chunk_size from checkpoint: {checkpoint_action_chunk_size}")
+                    NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    # Update the constant in all relevant modules
+                    import prismatic.vla.constants as constants_module
+                    constants_module.NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    import prismatic.models.action_heads as action_heads_module
+                    action_heads_module.NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    # Override cfg.action_chunk_size if user mistakenly provided it
+                    if cfg.action_chunk_size is not None and cfg.action_chunk_size != checkpoint_action_chunk_size:
+                        print(f"WARNING: Ignoring command-line action_chunk_size={cfg.action_chunk_size}, using checkpoint value={checkpoint_action_chunk_size}")
+                    cfg.action_chunk_size = checkpoint_action_chunk_size
+                
+                # Determine base model path
+                if cfg.base_model_path is not None:
+                    # User explicitly specified base model
+                    original_vla_path = cfg.base_model_path
+                    print(f"Using user-specified base model: {original_vla_path}")
+                elif "vla_path" in saved_args:
+                    # Use the original vla_path from when training started
+                    original_vla_path = saved_args["vla_path"]
+                    print(f"Using base model from checkpoint config: {original_vla_path}")
+                else:
+                    # Default to openvla-7b
+                    original_vla_path = "openvla/openvla-7b"
+                    print(f"Using default base model: {original_vla_path}")
+                
+                # Update vla_path to point to base model, not checkpoint
+                cfg.vla_path = original_vla_path
+                print(f"Base model path: {cfg.vla_path}")
+                print(f"Checkpoint directory: {checkpoint_dir}")
+    elif cfg.action_chunk_size is not None:
+        # Not resuming, use command-line value
         print(f"Overriding NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK} -> {cfg.action_chunk_size}")
         NUM_ACTIONS_CHUNK = cfg.action_chunk_size
         
@@ -1216,15 +1364,23 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # LoRA setup
     if cfg.use_lora:
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
-        vla.print_trainable_parameters()
+        if cfg.resume and checkpoint_dir is not None:
+            # Resume from checkpoint: load existing LoRA adapter
+            lora_adapter_path = checkpoint_dir / "lora_adapter"
+            print(f"Loading LoRA adapter from checkpoint: {lora_adapter_path}")
+            vla = PeftModel.from_pretrained(vla, str(lora_adapter_path), is_trainable=True)
+            vla.print_trainable_parameters()
+        else:
+            # Start new training: create new LoRA adapter
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
+            vla.print_trainable_parameters()
 
     # FiLM setup
     if cfg.use_film:
@@ -1238,8 +1394,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             llm_dim=vla.llm_dim,
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
-        if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+        if cfg.resume and checkpoint_dir is not None:
+            state_dict = load_checkpoint("vision_backbone", str(checkpoint_dir), cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
@@ -1259,6 +1415,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            checkpoint_dir=checkpoint_dir,
         )
 
     # If applicable, instantiate pointcloud input projector
@@ -1276,6 +1433,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "num_points": pointcloud_input_num_points,
                 "point_dim": cfg.pointcloud_input_dim,
             },
+            checkpoint_dir=checkpoint_dir,
         )
 
     # If applicable, instantiate continuous action head for L1 regression
@@ -1286,6 +1444,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            checkpoint_dir=checkpoint_dir,
             to_bf16=True,
         )
 
@@ -1302,10 +1461,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
             },
+            checkpoint_dir=checkpoint_dir,
             to_bf16=True,
         )
         noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim},
+            checkpoint_dir=checkpoint_dir,
         )
 
     # If applicable, instantiate tracking head
@@ -1331,6 +1492,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             tracking_module_args,
+            checkpoint_dir=checkpoint_dir,
             to_bf16=True,
         )
 
@@ -1370,6 +1532,32 @@ def finetune(cfg: FinetuneConfig) -> None:
         milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
+
+    # Load optimizer and scheduler states when resuming
+    if cfg.resume and cfg.resume_checkpoint_dir is not None:
+        checkpoint_dir = Path(cfg.resume_checkpoint_dir)
+        # Determine checkpoint name suffix
+        if cfg.save_latest_checkpoint_only:
+            checkpoint_name_suffix = "latest_checkpoint.pt"
+        else:
+            checkpoint_name_suffix = f"{cfg.resume_step}_checkpoint.pt"
+        
+        optimizer_path = checkpoint_dir / f"optimizer--{checkpoint_name_suffix}"
+        scheduler_path = checkpoint_dir / f"scheduler--{checkpoint_name_suffix}"
+        
+        if optimizer_path.exists():
+            print(f"Loading optimizer state from {optimizer_path}")
+            optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
+            print("Optimizer state loaded successfully")
+        else:
+            print(f"WARNING: Optimizer checkpoint not found at {optimizer_path}. Starting with fresh optimizer state.")
+        
+        if scheduler_path.exists():
+            print(f"Loading scheduler state from {scheduler_path}")
+            scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
+            print("Scheduler state loaded successfully")
+        else:
+            print(f"WARNING: Scheduler checkpoint not found at {scheduler_path}. Starting with fresh scheduler state.")
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1412,6 +1600,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         normalize_pointcloud=cfg.normalize_pointcloud,
         normalize_tracking=cfg.normalize_tracking,
         precomputed_statistics_path=cfg.precomputed_statistics_path,
+        filename=cfg.tracking_tracks_filename,
     )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1464,12 +1653,35 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    # Create an infinite dataloader iterator that restarts when exhausted
+    def infinite_dataloader(dataloader):
+        """Infinite dataloader that restarts when one epoch is complete."""
+        epoch = 0
+        while True:
+            if epoch > 0:
+                print(f"\n{'='*80}")
+                print(f"Epoch {epoch} finished! Starting epoch {epoch + 1}...")
+                print(f"{'='*80}\n")
+            epoch += 1
+            for batch in dataloader:
+                yield batch
+    
+    dataloader_iter = infinite_dataloader(dataloader)
+    
+    # Calculate remaining steps for resume
+    start_step = cfg.resume_step if (cfg.resume and cfg.resume_step is not None) else 0
+    remaining_steps = cfg.max_steps - start_step
+    total_batches = remaining_steps * cfg.grad_accumulation_steps
+    
+    print(f"Training from step {start_step} to {cfg.max_steps} ({remaining_steps} steps remaining)")
+    
+    with tqdm.tqdm(total=remaining_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx in range(total_batches):
+            batch = next(dataloader_iter)
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            log_step = start_step + gradient_step_idx
             capture_tracking = (
                 cfg.use_tracking_head
                 and cfg.save_tracking_viz
@@ -1477,6 +1689,13 @@ def finetune(cfg: FinetuneConfig) -> None:
                 and ((batch_idx + 1) % cfg.grad_accumulation_steps == 0)
                 and (log_step % cfg.tracking_viz_freq == 0)
             )
+            
+            # Log progress at visualization steps for debugging
+            if log_step % cfg.tracking_viz_freq == 0 and distributed_state.is_main_process:
+                print(f"\n{'='*80}")
+                print(f"[Step {log_step}] Starting training iteration (batch_idx={batch_idx})")
+                print(f"{'='*80}\n")
+            
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics, tracking_debug = run_forward_pass(
@@ -1521,8 +1740,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
-            if tracking_debug is not None:
+            # Save tracking visualizations only on main process to avoid DDP sync issues
+            # Use capture_tracking condition which is consistent across all processes
+            should_sync_after_viz = (
+                cfg.use_tracking_head
+                and cfg.save_tracking_viz
+                and ((batch_idx + 1) % cfg.grad_accumulation_steps == 0)
+                and (log_step % cfg.tracking_viz_freq == 0)
+                and distributed_state.num_processes > 1
+            )
+            
+            if tracking_debug is not None and distributed_state.is_main_process:
                 viz_dir = cfg.tracking_viz_dir if cfg.tracking_viz_dir is not None else run_dir / "tracking_viz"
+                print(f"[Main Process] Starting visualization save at step {log_step}...")
                 save_tracking_visualizations(
                     tracking_debug,
                     viz_dir,
@@ -1530,6 +1760,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                     tracking_labels_are_deltas=cfg.tracking_tracks_root is not None,
                     max_points=cfg.tracking_viz_max_points,
                 )
+                print(f"[Main Process] Completed visualization save at step {log_step}")
+            
+            # Synchronize all processes after visualization to prevent timeout
+            # IMPORTANT: All processes must reach this barrier, not just main process
+            if should_sync_after_viz:
+                print(f"[Rank {distributed_state.process_index}] Waiting at barrier after visualization step {log_step}...")
+                dist.barrier()
+                print(f"[Rank {distributed_state.process_index}] Passed barrier after visualization")
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
@@ -1575,6 +1813,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     tracking_head=tracking_head if cfg.use_tracking_head else None,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
                 )
 
             # Test model on validation set
