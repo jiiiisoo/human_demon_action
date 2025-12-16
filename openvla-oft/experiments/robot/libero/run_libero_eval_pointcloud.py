@@ -531,6 +531,8 @@ def run_episode(
 
         action = action_queue.popleft()
         action = process_action(action, cfg.model_family)
+        print(action)
+        1/0
         obs, reward, done, info = env.step(action.tolist())
         print('End')
         if done:
@@ -539,14 +541,15 @@ def run_episode(
         t += 1
 
         # refresh pointcloud
-        print('Refresh pointcloud')
-        pc_np = pointcloud_from_env(
-            env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
-        )
-        pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
-        if pc_debug_dir is not None and cfg.save_pc_debug:
-            save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
-        print('Refresh pointcloud done')
+        if cfg.point_visualize :
+            print('Refresh pointcloud')
+            pc_np = pointcloud_from_env(
+                env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
+            )
+            pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+            if pc_debug_dir is not None and cfg.save_pc_debug:
+                save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
+            print('Refresh pointcloud done')
 
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
