@@ -605,6 +605,31 @@ class LIBEROHdf5Dataset(Dataset):
         
         return denormalized
     
+    def normalize_proprio(self, proprio: np.ndarray) -> np.ndarray:
+        """
+        Normalize proprioceptive state using BOUNDS_Q99 method (same as action normalization).
+        Maps [q01, q99] -> [-1, 1]
+        
+        Args:
+            proprio: np.ndarray of shape (proprio_dim,)
+        
+        Returns:
+            Normalized proprio of same shape
+        """
+        if "proprio" not in self._statistics_data:
+            return proprio
+        
+        q01 = np.array(self._statistics_data["proprio"]["q01"])
+        q99 = np.array(self._statistics_data["proprio"]["q99"])
+        
+        # BOUNDS_Q99: [q01, q99] -> [-1, 1]
+        normalized = 2.0 * (proprio - q01) / (q99 - q01 + 1e-8) - 1.0
+        
+        # Clip to [-1, 1] for safety
+        normalized = np.clip(normalized, -1.0, 1.0)
+        
+        return normalized
+    
     def denormalize_tracking(self, tracking: np.ndarray) -> np.ndarray:
         """
         Denormalize tracking data back to original scale.
@@ -649,13 +674,13 @@ class LIBEROHdf5Dataset(Dataset):
         
         # Load primary image (agentview)
         image_primary = demo_grp["obs"]["agentview_rgb"][frame_idx]  # (H, W, 3)
+        image_primary = image_primary[::-1, ::-1]  # 180 degree rotation
         
         # Load wrist image if needed
         if self.use_wrist_image and "eye_in_hand_rgb" in demo_grp["obs"]:
             image_wrist = demo_grp["obs"]["eye_in_hand_rgb"][frame_idx]  # (H, W, 3)
-        else:
-            image_wrist = np.zeros_like(image_primary)
-        
+            image_wrist = image_wrist[::-1, ::-1]  # 180 degree rotation
+
         # Load proprioception: [gripper_qpos(2), ee_pos(3), ee_ori(3)] = 8D
         gripper_states = demo_grp["obs"]["gripper_states"][frame_idx]  # (2,)
         ee_states = demo_grp["obs"]["ee_states"][frame_idx]  # (6,)
@@ -753,14 +778,14 @@ class LIBEROHdf5Dataset(Dataset):
         # Normalize actions using BOUNDS_Q99 (same as RLDS)
         frame_data["action"] = self.normalize_action(frame_data["action"])
         
-        # if self.should_normalize_pointcloud and "pointcloud" in frame_data:
+        # Normalize proprioceptive state using BOUNDS_Q99
+        proprio = frame_data["observation"]["proprio"]
+        frame_data["observation"]["proprio"] = self.normalize_proprio(proprio)
+        
         pc = frame_data["pointcloud"]
-        # if pc is not None:
         frame_data["pointcloud"] = self.normalize_pointcloud(pc)
         
-        # if self.should_normalize_tracking and "tracking" in frame_data:
         tracking = frame_data["tracking"]
-            # if tracking is not None:
         frame_data["tracking"] = self.normalize_tracking(tracking)
         
         # Apply batch transform (converts to tensors)
