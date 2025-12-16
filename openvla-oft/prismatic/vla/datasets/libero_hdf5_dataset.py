@@ -696,12 +696,19 @@ class LIBEROHdf5Dataset(Dataset):
         actions = np.stack(actions, axis=0)  # (action_chunk_size, action_dim)
         
         # Build observation dict
-        observation = {
-            "image_primary": image_primary,
-            "image_wrist": image_wrist,
-            "proprio": proprio,
-            "timestep": np.array([frame_idx], dtype=np.int32),
-        }
+        if self.use_wrist_image:
+            observation = {
+                "image_primary": image_primary,
+                "image_wrist": image_wrist,
+                "proprio": proprio,
+                "timestep": np.array([frame_idx], dtype=np.int32),
+            }
+        else:
+            observation = {
+                "image_primary": image_primary,
+                "proprio": proprio,
+                "timestep": np.array([frame_idx], dtype=np.int32),
+            }
         
         # Add episode_name for external data loading (point clouds, tracks)
         observation["episode_name"] = ep_info["point_cloud_id"]
