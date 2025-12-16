@@ -120,6 +120,7 @@ class GenerateConfig:
 
     center_crop: bool = True
     num_open_loop_steps: int = 8
+    action_chunk_size: Optional[int] = None
     lora_rank: int = 32
     unnorm_key: Union[str, Path] = ""
     load_in_8bit: bool = False
@@ -452,12 +453,9 @@ def run_episode(
             obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
             t += 1
             continue
-        print(f"Step {t}")
 
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
-
-        print('Start')
 
         if len(action_queue) == 0:
             if cfg.use_pointcloud_input:
@@ -527,14 +525,12 @@ def run_episode(
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
+            actions = actions[:8]
             action_queue.extend(actions)
 
         action = action_queue.popleft()
         action = process_action(action, cfg.model_family)
-        print(action)
-        1/0
         obs, reward, done, info = env.step(action.tolist())
-        print('End')
         if done:
             success = True
             break
@@ -641,6 +637,71 @@ def run_task(
 def eval_libero(cfg: GenerateConfig) -> float:
     validate_config(cfg)
     set_seed_everywhere(cfg.seed)
+    
+    # Load action_chunk_size from checkpoint if available
+    global NUM_ACTIONS_CHUNK
+    if cfg.pretrained_checkpoint and os.path.isdir(cfg.pretrained_checkpoint):
+        args_config_path = Path(cfg.pretrained_checkpoint) / "args_config.json"
+        if args_config_path.exists():
+            with open(args_config_path, "r") as f:
+                saved_args = json.load(f)
+                
+                # Load action_chunk_size from checkpoint
+                if "action_chunk_size" in saved_args and saved_args["action_chunk_size"] is not None:
+                    checkpoint_action_chunk_size = saved_args["action_chunk_size"]
+                    logger.info(f"Loading action_chunk_size from checkpoint: {checkpoint_action_chunk_size}")
+                    NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    # Update the constant in all relevant modules
+                    import prismatic.vla.constants as constants_module
+                    constants_module.NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    import prismatic.models.action_heads as action_heads_module
+                    action_heads_module.NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    # Override cfg.action_chunk_size if user mistakenly provided it
+                    if cfg.action_chunk_size is not None and cfg.action_chunk_size != checkpoint_action_chunk_size:
+                        logger.warning(
+                            f"Ignoring command-line action_chunk_size={cfg.action_chunk_size}, "
+                            f"using checkpoint value={checkpoint_action_chunk_size}"
+                        )
+                    cfg.action_chunk_size = checkpoint_action_chunk_size
+        else:
+            # No args_config.json found, use command-line value if provided
+            if cfg.action_chunk_size is not None:
+                logger.info(f"Overriding NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK} -> {cfg.action_chunk_size}")
+                NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+                
+                # Update the constant in all relevant modules
+                import prismatic.vla.constants as constants_module
+                constants_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+                
+                import prismatic.models.action_heads as action_heads_module
+                action_heads_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+    elif cfg.action_chunk_size is not None:
+        # Not a directory checkpoint, use command-line value if provided
+        logger.info(f"Overriding NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK} -> {cfg.action_chunk_size}")
+        NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+        
+        # Update the constant in all relevant modules
+        import prismatic.vla.constants as constants_module
+        constants_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+        
+        import prismatic.models.action_heads as action_heads_module
+        action_heads_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+    
+    # Print detected constants
+    logger.info(
+        f"Detected constants:\n"
+        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
+        f"\tACTION_DIM: {ACTION_DIM}"
+    )
+    
+    # Set num_open_loop_steps to match NUM_ACTIONS_CHUNK if not explicitly set
+    if cfg.num_open_loop_steps == 8 and NUM_ACTIONS_CHUNK != 8:
+        logger.info(f"Setting num_open_loop_steps to match NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}")
+        cfg.num_open_loop_steps = NUM_ACTIONS_CHUNK
+    
     (
         model,
         action_head,
