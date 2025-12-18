@@ -54,7 +54,6 @@ from experiments.robot.openvla_utils import (
     get_proprio_projector,
     resize_image_for_policy,
     prepare_images_for_vla,
-    normalize_proprio,
 )
 from experiments.robot.robot_utils import (
     DATE,
@@ -556,18 +555,20 @@ def run_episode(
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     # initial pointcloud
-    pc_np = pointcloud_from_env(
-        env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
-    )
+    if cfg.point_visualize:
+        pc_np = pointcloud_from_env(
+            env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
+        )
     
     # Normalize pointcloud if statistics are available and normalization is enabled
-    if cfg.normalize_pointcloud and dataset_statistics is not None:
+    if cfg.point_visualize and cfg.normalize_pointcloud and dataset_statistics is not None:
         pc_np = normalize_pointcloud(pc_np, dataset_statistics)
     
     device = model.device if hasattr(model, "device") else 0
-    pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+    if cfg.point_visualize:
+        pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
     pc_debug_dir = None
-    if cfg.use_pointcloud_input and (cfg.save_pc_debug or cfg.point_visualize):
+    if cfg.point_visualize and (cfg.save_pc_debug or cfg.point_visualize):
         pc_debug_dir = Path(cfg.rollout_dir) / DATE / "pc_debug"
         pc_debug_dir.mkdir(parents=True, exist_ok=True)
         if cfg.save_pc_debug:
@@ -611,16 +612,7 @@ def run_episode(
                 proprio = observation["state"]
                 # Normalize proprio using dataset statistics (same as training)
                 # if dataset_statistics is not None and "proprio" in dataset_statistics:
-                #     proprio = normalize_proprio(proprio, dataset_statistics)
-                # else:
-                #     # Fallback to model's normalization if dataset statistics not available
-                #     logger.warning("Dataset statistics not available for proprio, using model's norm_stats")
-                #     if cfg.unnorm_key and cfg.unnorm_key in model.norm_stats:
-                #         proprio_norm_stats = model.norm_stats[cfg.unnorm_key]["proprio"]
-                #         q01 = np.array(proprio_norm_stats["q01"])
-                #         q99 = np.array(proprio_norm_stats["q99"])
-                #         proprio = 2.0 * (proprio - q01) / (q99 - q01 + 1e-8) - 1.0
-                #         proprio = np.clip(proprio, -1.0, 1.0)
+                proprio = normalize_proprio(proprio, dataset_statistics)
                 proprio = torch.tensor(proprio, device=inputs["input_ids"].device).unsqueeze(0)
             if cfg.use_pointcloud_input:
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -714,7 +706,7 @@ def run_episode(
                         attention_mask=inputs["attention_mask"],
                         pixel_values=inputs["pixel_values"].to(torch.bfloat16),
                         proprio=proprio,
-                        proprio_projector= None,
+                        proprio_projector= proprio_projector,
                         pointcloud=None,
                         pointcloud_projector= None,
                         unnorm_key=None,  # Don't use model's denormalization
@@ -748,7 +740,7 @@ def run_episode(
                 #     else:
                 #         logger.warning("Model norm_stats not available for re-normalization")
             
-            actions = actions[:8]
+            actions = actions
             action_queue.extend(actions)
 
         action = action_queue.popleft()
