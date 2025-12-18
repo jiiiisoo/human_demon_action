@@ -1075,21 +1075,25 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 action_head,
             )
 
-        # Unnormalize predicted actions
-        actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+        # Unnormalize predicted actions (skip if unnorm_key is None)
+        if unnorm_key is not None:
+            actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+        else:
+            # Return normalized actions as-is when unnorm_key=None
+            actions = normalized_actions
 
-        return actions, actions_hidden_states
+        return actions, normalized_actions, actions_hidden_states
 
     @staticmethod
-    def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
-        """Validate and resolve the unnormalization key for action statistics"""
+    def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> Optional[str]:
+        """Validate and resolve the unnormalization key for action statistics
+        
+        Returns None if unnorm_key is None (indicating normalization should be skipped)
+        """
         if unnorm_key is None:
-            assert len(norm_stats) == 1, (
-                f"Your model was trained on more than one dataset, "
-                f"please pass a `unnorm_key` from the following options to choose the statistics "
-                f"used for un-normalizing actions: {norm_stats.keys()}"
-            )
-            unnorm_key = next(iter(norm_stats.keys()))
+            # If None is explicitly passed, return None (don't auto-select a key)
+            # This allows callers to skip denormalization by passing unnorm_key=None
+            return None
 
         assert unnorm_key in norm_stats, (
             f"The `unnorm_key` you chose is not in the set of available dataset statistics, "
@@ -1099,10 +1103,18 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
         """Get the dimensionality of the policy's action space."""
+        if unnorm_key is None and len(self.norm_stats) == 1:
+            unnorm_key = next(iter(self.norm_stats.keys()))
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
+        if unnorm_key is None:
+            raise ValueError("unnorm_key is required to get action dimension")
         return len(self.norm_stats[unnorm_key]["action"]["min"])
 
     def get_action_stats(self, unnorm_key: Optional[str] = None) -> Dict[str, Any]:
         """Get all the logged statistics for the given dataset."""
+        if unnorm_key is None and len(self.norm_stats) == 1:
+            unnorm_key = next(iter(self.norm_stats.keys()))
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
+        if unnorm_key is None:
+            raise ValueError("unnorm_key is required to get action statistics")
         return self.norm_stats[unnorm_key]["action"]
