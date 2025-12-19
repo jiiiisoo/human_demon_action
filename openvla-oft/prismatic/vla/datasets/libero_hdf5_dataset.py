@@ -839,12 +839,14 @@ class LIBEROHdf5Dataset(Dataset):
         # Normalize proprioceptive state using BOUNDS_Q99
         proprio = frame_data["observation"]["proprio"]
         frame_data["observation"]["proprio"] = self.normalize_proprio(proprio)
+
+        if self.tracking_tracks_root:
         
-        pc = frame_data["pointcloud"]
-        frame_data["pointcloud"] = self.normalize_pointcloud(pc)
-        
-        tracking = frame_data["tracking"]
-        frame_data["tracking"] = self.normalize_tracking(tracking)
+            pc = frame_data["pointcloud"]
+            frame_data["pointcloud"] = self.normalize_pointcloud(pc)
+            
+            tracking = frame_data["tracking"]
+            frame_data["tracking"] = self.normalize_tracking(tracking)
         
         # Apply batch transform (converts to tensors)
         transformed = self.batch_transform(frame_data)
