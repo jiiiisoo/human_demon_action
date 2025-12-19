@@ -485,8 +485,8 @@ def run_forward_pass(
             # Predict action
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
             # Get full L1 loss
-            # action_l1_loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
-            action_l1_loss = torch.nn.L1Loss()(ground_truth_actions[:,:8,:], predicted_actions[:,:8,:])
+            action_l1_loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            # action_l1_loss = torch.nn.L1Loss()(ground_truth_actions[:,:8,:], predicted_actions[:,:8,:])
             loss = action_l1_loss if loss is None else loss + action_l1_loss
 
         if use_diffusion:

@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import tqdm
 from PIL import Image
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
@@ -271,6 +272,50 @@ class LIBEROHdf5Dataset(Dataset):
         else:
             print("  Computing dataset statistics (this may take a while)...")
             self._compute_statistics()
+
+    def _augment_image_np(self, img: np.ndarray, seed: int) -> np.ndarray:
+        """
+        Apply augmentations with deterministic RNG (per-sample seed) to match RLDS order:
+        resize -> random_resized_crop -> color jitter.
+        """
+        rng = np.random.RandomState(seed)
+        pil_img = Image.fromarray(img)
+
+        # 1) Resize to target resolution (RLDS decode_and_resize)
+        pil_img = pil_img.resize(self.resize_resolution[::-1], resample=Image.BILINEAR)
+
+        # 2) RandomResizedCrop with scale=0.9, ratio=1.0
+        w, h = pil_img.size
+        scale = 0.9
+        crop_size = int(round(scale * min(w, h)))
+        crop_h = crop_w = max(1, crop_size)
+        if w == crop_w:
+            j = 0
+        else:
+            j = rng.randint(0, w - crop_w + 1)
+        if h == crop_h:
+            i = 0
+        else:
+            i = rng.randint(0, h - crop_h + 1)
+        pil_img = TF.resized_crop(pil_img, top=i, left=j, height=crop_h, width=crop_w, size=(h, w), antialias=True)
+
+        # 3) Color jitter
+        b_factor = 1.0 + rng.uniform(-0.2, 0.2)  # brightness delta 0.2
+        c_factor = rng.uniform(0.8, 1.2)          # contrast
+        s_factor = rng.uniform(0.8, 1.2)          # saturation
+        h_factor = rng.uniform(-0.05, 0.05)       # hue
+        pil_img = TF.adjust_brightness(pil_img, b_factor)
+        pil_img = TF.adjust_contrast(pil_img, c_factor)
+        pil_img = TF.adjust_saturation(pil_img, s_factor)
+        pil_img = TF.adjust_hue(pil_img, h_factor)
+
+        return np.array(pil_img, dtype=np.uint8)
+
+    def _augment_observation_images(self, observation: Dict[str, Any], seed: int) -> None:
+        """Apply image augmentations in-place to primary (and wrist if present) images."""
+        observation["image_primary"] = self._augment_image_np(observation["image_primary"], seed)
+        if self.use_wrist_image and "image_wrist" in observation:
+            observation["image_wrist"] = self._augment_image_np(observation["image_wrist"], seed + 1)
         
     def _build_episode_index(self):
         """Build an index of all episodes across all HDF5 files."""
@@ -778,6 +823,12 @@ class LIBEROHdf5Dataset(Dataset):
         with h5py.File(ep_info["hdf5_path"], "r") as f:
             demo_grp = f["data"][ep_info["demo_name"]]
             frame_data = self._load_frame(f, demo_grp, frame_idx, ep_info)
+
+        # Apply image augmentations (train only)
+        if self.train and self.image_aug:
+            # Use deterministic seed per-sample for reproducibility
+            aug_seed = self.seed + idx
+            self._augment_observation_images(frame_data["observation"], aug_seed)
         
         # Apply normalization BEFORE batch transform
         # This way we normalize the raw numpy data before tensorization
@@ -926,4 +977,3 @@ if __name__ == "__main__":
             break
     
     print("\nDataset test complete!")
-
