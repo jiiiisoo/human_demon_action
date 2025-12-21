@@ -67,6 +67,7 @@ class LIBEROBatchTransform:
     use_proprio: bool = False
     use_pointcloud_input: bool = False
     use_tracking_head: bool = False
+    tracking_use_pointcloud_input: bool = False
     
     def __call__(self, libero_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -761,32 +762,38 @@ class LIBEROHdf5Dataset(Dataset):
         # Load tracking data from tracking file if available
         pointcloud = None
         tracking_deltas = None
-        
-        if self.tracking_tracks_root and ep_info["point_cloud_id"]:
+        load_pointcloud = bool(getattr(self.batch_transform, "use_pointcloud_input", False)) or bool(
+            getattr(self.batch_transform, "tracking_use_pointcloud_input", False)
+        )
+        load_tracking = bool(getattr(self.batch_transform, "use_tracking_head", False))
+
+        if (load_pointcloud or load_tracking) and self.tracking_tracks_root and ep_info["point_cloud_id"]:
             track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / self.filename
             if track_file.exists():
                 tracks = np.load(track_file)  # (T, num_points, 3)
-                
-                # Initial pointcloud (for both VLA input and tracking head)
-                # Use tracks[frame_idx] as the current state
-                # Note: frame_idx is guaranteed to be valid by _build_frame_index()
-                pointcloud = tracks[frame_idx]  # (num_points, 3)
-                
-                # Tracking deltas for action chunk
-                # If actions are frame_idx to frame_idx+chunk_size-1,
-                # tracking deltas are tracks[frame_idx+1] - tracks[frame_idx], 
-                #                    tracks[frame_idx+2] - tracks[frame_idx+1], ...
-                tracking_deltas = []
-                for offset in range(self.action_chunk_size):
-                    t_curr = frame_idx + offset
-                    t_next = t_curr + 1
-                    
-                    # Both t_curr and t_next are guaranteed to be in bounds
-                    # because frame_idx + action_chunk_size <= num_frames < len(tracks)
-                    delta = tracks[t_next] - tracks[t_curr]  # (num_points, 3)
-                    tracking_deltas.append(delta)
-                
-                tracking_deltas = np.stack(tracking_deltas, axis=0)  # (action_chunk_size, num_points, 3)
+
+                if load_pointcloud:
+                    # Initial pointcloud (for both VLA input and tracking head)
+                    # Use tracks[frame_idx] as the current state
+                    # Note: frame_idx is guaranteed to be valid by _build_frame_index()
+                    pointcloud = tracks[frame_idx]  # (num_points, 3)
+
+                if load_tracking:
+                    # Tracking deltas for action chunk
+                    # If actions are frame_idx to frame_idx+chunk_size-1,
+                    # tracking deltas are tracks[frame_idx+1] - tracks[frame_idx],
+                    #                    tracks[frame_idx+2] - tracks[frame_idx+1], ...
+                    tracking_deltas = []
+                    for offset in range(self.action_chunk_size):
+                        t_curr = frame_idx + offset
+                        t_next = t_curr + 1
+
+                        # Both t_curr and t_next are guaranteed to be in bounds
+                        # because frame_idx + action_chunk_size <= num_frames < len(tracks)
+                        delta = tracks[t_next] - tracks[t_curr]  # (num_points, 3)
+                        tracking_deltas.append(delta)
+
+                    tracking_deltas = np.stack(tracking_deltas, axis=0)  # (action_chunk_size, num_points, 3)
         
         # Build task dict
         task = {
@@ -841,10 +848,12 @@ class LIBEROHdf5Dataset(Dataset):
         frame_data["observation"]["proprio"] = self.normalize_proprio(proprio)
         
         pc = frame_data["pointcloud"]
-        frame_data["pointcloud"] = self.normalize_pointcloud(pc)
+        if pc is not None:
+            frame_data["pointcloud"] = self.normalize_pointcloud(pc)
         
         tracking = frame_data["tracking"]
-        frame_data["tracking"] = self.normalize_tracking(tracking)
+        if tracking is not None:
+            frame_data["tracking"] = self.normalize_tracking(tracking)
         
         # Apply batch transform (converts to tensors)
         transformed = self.batch_transform(frame_data)
