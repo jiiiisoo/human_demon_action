@@ -175,7 +175,7 @@ def initialize_model(cfg: GenerateConfig):
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
-        check_unnorm_key(cfg, model)
+        # check_unnorm_key(cfg, model)
     pointcloud_projector = (
         PointcloudProjector(model.llm_dim, num_points=cfg.pointcloud_num_points, point_dim=cfg.pointcloud_dim)
         if cfg.use_pointcloud_input
@@ -264,6 +264,29 @@ def prepare_observation(obs, resize_size):
         "state": proprio,
     }
     return observation, img
+
+
+def center_crop_and_resize_np(img: np.ndarray, resize_size: Union[int, tuple], crop_scale: float = 0.9) -> np.ndarray:
+    """
+    Center-crop and resize an image to match training-time distribution.
+
+    Args:
+        img: HWC uint8 image
+        resize_size: Target size as int (square) or (height, width) tuple
+        crop_scale: Area scale for the center crop (0 < scale <= 1)
+    """
+    if isinstance(resize_size, int):
+        resize_size = (resize_size, resize_size)
+    pil_img = Image.fromarray(img)
+    pil_img = pil_img.resize(resize_size[::-1], resample=Image.BILINEAR)
+    w, h = pil_img.size
+    crop_size = int(round(crop_scale * min(w, h)))
+    crop_h = crop_w = max(1, crop_size)
+    i = max(0, (h - crop_h) // 2)
+    j = max(0, (w - crop_w) // 2)
+    pil_img = pil_img.crop((j, i, j + crop_w, i + crop_h))
+    pil_img = pil_img.resize((w, h), resample=Image.BILINEAR)
+    return np.array(pil_img, dtype=np.uint8)
 
 
 def process_action(action, model_family):
@@ -589,6 +612,8 @@ def run_episode(
             all_images = [observation["full_image"]]
             if cfg.num_images_in_input > 1:
                 all_images.append(observation["wrist_image"])
+            if cfg.center_crop:
+                all_images = [center_crop_and_resize_np(img, resize_size) for img in all_images]
             # all_images = prepare_images_for_vla(all_images, cfg)
             primary_image = all_images.pop(0)
             primary_image = Image.fromarray(primary_image)
