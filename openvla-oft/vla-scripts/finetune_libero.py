@@ -1579,6 +1579,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         use_proprio=cfg.use_proprio,
         use_pointcloud_input=cfg.use_pointcloud_input,
         use_tracking_head=cfg.use_tracking_head,
+        tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
     )
     
     # Create LIBERO HDF5 datasets (THIS IS THE KEY CHANGE)
