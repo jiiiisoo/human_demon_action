@@ -82,7 +82,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune.py \
   --tracking_viz_dir /mnt/data/jisookim/openvla_finetune/track_5000_input_head_onlytrack_w10_new_data_hidden8192_blocks3/videos \
   --tracking_loss_weight 10.0 \
   --tracking_dim 3 \
-  --tracking_num_points 5000 \
-  --pointcloud_input_num_points 5000 \
+  --tracking_num_points 1024 \
+  --pointcloud_input_num_points 1024 \
   --pointcloud_input_dim 3 \
   --grad_accumulation_steps 4 \

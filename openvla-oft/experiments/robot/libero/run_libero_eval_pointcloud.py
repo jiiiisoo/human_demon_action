@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 import glob
+from transformers import AutoProcessor
 
 import draccus
 try:
@@ -34,6 +35,7 @@ from PIL import Image
 
 import wandb
 import torch
+import robosuite.utils.transform_utils as T
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
@@ -52,7 +54,6 @@ from experiments.robot.openvla_utils import (
     get_proprio_projector,
     resize_image_for_policy,
     prepare_images_for_vla,
-    normalize_proprio,
 )
 from experiments.robot.robot_utils import (
     DATE,
@@ -120,6 +121,7 @@ class GenerateConfig:
 
     center_crop: bool = True
     num_open_loop_steps: int = 8
+    action_chunk_size: Optional[int] = None
     lora_rank: int = 32
     unnorm_key: Union[str, Path] = ""
     load_in_8bit: bool = False
@@ -135,6 +137,9 @@ class GenerateConfig:
     point_visualize: bool = False
     tracking_num_points: int = 512
     tracking_dim: int = 3
+    normalize_pointcloud: bool = True
+    normalize_tracking: bool = True
+    precomputed_statistics_path: Optional[Union[str, Path]] = None
 
     # LIBERO env
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL
@@ -170,7 +175,7 @@ def initialize_model(cfg: GenerateConfig):
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
-        check_unnorm_key(cfg, model)
+        # check_unnorm_key(cfg, model)
     pointcloud_projector = (
         PointcloudProjector(model.llm_dim, num_points=cfg.pointcloud_num_points, point_dim=cfg.pointcloud_dim)
         if cfg.use_pointcloud_input
@@ -242,24 +247,52 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
 
 
 def prepare_observation(obs, resize_size):
-    img = get_libero_image(obs)
+    # processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
+    img = get_libero_image(obs) # for 180 degree rotation
+    # img = Image.fromarray(img)
+    # img = processor.image_processor.apply_transform(img)
+    # img = obs["agentview_image"]
     wrist_img = get_libero_wrist_image(obs)
-    img_resized = resize_image_for_policy(img, resize_size)
-    wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
+    # wrist_img = Image.fromarray(wrist_img)
+    # wrist_img = processor.image_processor.apply_transform(wrist_img)
+    # img_resized = resize_image_for_policy(img, resize_size)
+    # wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
+    proprio = np.concatenate([obs["robot0_gripper_qpos"], np.hstack([obs["robot0_eef_pos"], T.quat2axisangle(obs["robot0_eef_quat"])])])
     observation = {
-        "full_image": img_resized,
-        "wrist_image": wrist_img_resized,
-        "state": np.concatenate(
-            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-        ),
+        "full_image": img,
+        "wrist_image": wrist_img,
+        "state": proprio,
     }
     return observation, img
 
 
+def center_crop_and_resize_np(img: np.ndarray, resize_size: Union[int, tuple], crop_scale: float = 0.9) -> np.ndarray:
+    """
+    Center-crop and resize an image to match training-time distribution.
+
+    Args:
+        img: HWC uint8 image
+        resize_size: Target size as int (square) or (height, width) tuple
+        crop_scale: Area scale for the center crop (0 < scale <= 1)
+    """
+    if isinstance(resize_size, int):
+        resize_size = (resize_size, resize_size)
+    pil_img = Image.fromarray(img)
+    pil_img = pil_img.resize(resize_size[::-1], resample=Image.BILINEAR)
+    w, h = pil_img.size
+    crop_size = int(round(crop_scale * min(w, h)))
+    crop_h = crop_w = max(1, crop_size)
+    i = max(0, (h - crop_h) // 2)
+    j = max(0, (w - crop_w) // 2)
+    pil_img = pil_img.crop((j, i, j + crop_w, i + crop_h))
+    pil_img = pil_img.resize((w, h), resample=Image.BILINEAR)
+    return np.array(pil_img, dtype=np.uint8)
+
+
 def process_action(action, model_family):
     action = normalize_gripper_action(action, binarize=True)
-    if model_family == "openvla":
-        action = invert_gripper_action(action)
+    # if model_family == "openvla":
+    #     action = invert_gripper_action(action)
     return action
 
 
@@ -400,6 +433,115 @@ def remove_ddp_prefix(state_dict):
     return new_sd
 
 
+def normalize_pointcloud(pointcloud: np.ndarray, dataset_statistics: dict) -> np.ndarray:
+    """
+    Normalize pointcloud using dataset statistics (x, y, z separately).
+    Same implementation as LIBEROHdf5Dataset.normalize_pointcloud().
+    
+    Args:
+        pointcloud: np.ndarray of shape (N, 3) or (N, D) where D >= 3
+        dataset_statistics: dict containing pointcloud statistics
+    
+    Returns:
+        Normalized pointcloud of same shape
+    """
+    if "pointcloud" not in dataset_statistics:
+        return pointcloud
+    
+    pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
+    pc_std = np.array(dataset_statistics["pointcloud"]["std"])
+    
+    # Avoid division by zero
+    pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
+    
+    # Normalize (only first 3 dimensions if D > 3)
+    normalized = pointcloud.copy()
+    normalized[:, :3] = (pointcloud[:, :3] - pc_mean) / pc_std
+    
+    return normalized
+
+
+def denormalize_tracking(tracking: np.ndarray, dataset_statistics: dict) -> np.ndarray:
+    """
+    Denormalize tracking data back to original scale.
+    Same implementation as LIBEROHdf5Dataset.denormalize_tracking().
+    
+    Args:
+        tracking: Normalized tracking of shape (num_points, 3) or (T, num_points, 3)
+        dataset_statistics: dict containing tracking statistics
+    
+    Returns:
+        Denormalized tracking of same shape
+    """
+    if "tracking" not in dataset_statistics:
+        return tracking
+    
+    track_mean = np.array(dataset_statistics["tracking"]["mean"])
+    track_std = np.array(dataset_statistics["tracking"]["std"])
+
+    track_std = np.where(track_std < 1e-6, 1.0, track_std)
+    
+    if len(tracking.shape) == 2:
+        denormalized = tracking * track_std + track_mean
+    elif len(tracking.shape) == 3:
+        denormalized = tracking * track_std[None, None, :] + track_mean[None, None, :]
+    else:
+        denormalized = tracking
+    
+    return denormalized
+
+
+def normalize_proprio(proprio: np.ndarray, dataset_statistics: dict) -> np.ndarray:
+    """
+    Normalize proprioceptive state using BOUNDS_Q99 method (same as action normalization).
+    Same implementation as LIBEROHdf5Dataset.normalize_proprio().
+    
+    Args:
+        proprio: np.ndarray of shape (proprio_dim,)
+        dataset_statistics: dict containing proprio statistics
+    
+    Returns:
+        Normalized proprio of same shape
+    """
+    if "proprio" not in dataset_statistics:
+        return proprio
+    
+    q01 = np.array(dataset_statistics["proprio"]["q01"])
+    q99 = np.array(dataset_statistics["proprio"]["q99"])
+    
+    # BOUNDS_Q99: [q01, q99] -> [-1, 1]
+    normalized = 2.0 * (proprio - q01) / (q99 - q01 + 1e-8) - 1.0
+    
+    # Clip to [-1, 1] for safety
+    normalized = np.clip(normalized, -1.0, 1.0)
+    
+    return normalized
+
+
+def denormalize_action(action: np.ndarray, dataset_statistics: dict) -> np.ndarray:
+    """
+    Denormalize action from [-1, 1] back to original scale using BOUNDS_Q99.
+    Same implementation as LIBEROHdf5Dataset.denormalize_action().
+    
+    Args:
+        action: np.ndarray of shape (action_dim,) or (chunk_size, action_dim)
+        dataset_statistics: dict containing action statistics
+    
+    Returns:
+        Denormalized action of same shape
+    """
+    if "action" not in dataset_statistics:
+        return action
+    
+    q01 = np.array(dataset_statistics["action"]["q01"])
+    q99 = np.array(dataset_statistics["action"]["q99"])
+    
+    # Inverse of BOUNDS_Q99: denormalized = (normalized + 1) * (q99 - q01) / 2 + q01
+    denormalized = (action + 1.0) * (q99 - q01) / 2.0 + q01
+    
+    return denormalized
+
+
 def run_episode(
     cfg: GenerateConfig,
     env,
@@ -414,6 +556,7 @@ def run_episode(
     log_file=None,
     pointcloud_projector=None,
     tracking_head=None,
+    dataset_statistics=None,
 ):
     env.reset()
     if initial_state is not None:
@@ -427,6 +570,7 @@ def run_episode(
             f"({NUM_ACTIONS_CHUNK}) constant defined in prismatic.vla.constants! For best performance (in terms of "
             "both speed and success rate), we recommend executing the full action chunk."
         )
+        raise ValueError("cfg.num_open_loop_steps does not match the NUM_ACTIONS_CHUNK constant defined in prismatic.vla.constants!")
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
 
     t = 0
@@ -434,13 +578,20 @@ def run_episode(
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     # initial pointcloud
-    pc_np = pointcloud_from_env(
-        env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
-    )
+    if cfg.point_visualize:
+        pc_np = pointcloud_from_env(
+            env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
+        )
+    
+    # Normalize pointcloud if statistics are available and normalization is enabled
+    if cfg.point_visualize and cfg.normalize_pointcloud and dataset_statistics is not None:
+        pc_np = normalize_pointcloud(pc_np, dataset_statistics)
+    
     device = model.device if hasattr(model, "device") else 0
-    pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+    if cfg.point_visualize:
+        pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
     pc_debug_dir = None
-    if cfg.use_pointcloud_input and (cfg.save_pc_debug or cfg.point_visualize):
+    if cfg.point_visualize and (cfg.save_pc_debug or cfg.point_visualize):
         pc_debug_dir = Path(cfg.rollout_dir) / DATE / "pc_debug"
         pc_debug_dir.mkdir(parents=True, exist_ok=True)
         if cfg.save_pc_debug:
@@ -452,43 +603,45 @@ def run_episode(
             obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
             t += 1
             continue
-        print(f"Step {t}")
 
         observation, img = prepare_observation(obs, resize_size)
         replay_images.append(img)
 
-        print('Start')
-
         if len(action_queue) == 0:
+            prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
+            all_images = [observation["full_image"]]
+            if cfg.num_images_in_input > 1:
+                all_images.append(observation["wrist_image"])
+            if cfg.center_crop:
+                all_images = [center_crop_and_resize_np(img, resize_size) for img in all_images]
+            # all_images = prepare_images_for_vla(all_images, cfg)
+            primary_image = all_images.pop(0)
+            primary_image = Image.fromarray(primary_image)
+            inputs = processor(prompt, primary_image, return_tensors="pt").to(
+                model.device if hasattr(model, "device") else 0
+            )
+            if all_images:
+                image_wrist = Image.fromarray(image_wrist)
+                all_wrist_inputs = [
+                    processor(prompt, image_wrist, return_tensors="pt").to(
+                        model.device if hasattr(model, "device") else 0
+                    )
+                    for image_wrist in all_images
+                ]
+                primary_pixel_values = inputs["pixel_values"]
+                all_wrist_pixel_values = [wi["pixel_values"] for wi in all_wrist_inputs]
+                inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
+
+            proprio = None
+            if cfg.use_proprio:
+                proprio = observation["state"]
+                # Normalize proprio using dataset statistics (same as training)
+                # if dataset_statistics is not None and "proprio" in dataset_statistics:
+                proprio = normalize_proprio(proprio, dataset_statistics)
+                proprio = torch.tensor(proprio, device=inputs["input_ids"].device).unsqueeze(0)
             if cfg.use_pointcloud_input:
-                prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
-                all_images = [observation["full_image"]]
-                if cfg.num_images_in_input > 1:
-                    all_images.append(observation["wrist_image"])
-                all_images = prepare_images_for_vla(all_images, cfg)
-                primary_image = all_images.pop(0)
-                inputs = processor(prompt, primary_image, return_tensors="pt").to(
-                    model.device if hasattr(model, "device") else 0
-                )
-                if all_images:
-                    all_wrist_inputs = [
-                        processor(prompt, image_wrist, return_tensors="pt").to(
-                            model.device if hasattr(model, "device") else 0
-                        )
-                        for image_wrist in all_images
-                    ]
-                    primary_pixel_values = inputs["pixel_values"]
-                    all_wrist_pixel_values = [wi["pixel_values"] for wi in all_wrist_inputs]
-                    inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
-
-                proprio = None
-                if cfg.use_proprio:
-                    proprio = observation["state"]
-                    proprio_norm_stats = model.norm_stats[cfg.unnorm_key]["proprio"]
-                    observation["state"] = normalize_proprio(proprio, proprio_norm_stats)
-                    proprio = torch.tensor(observation["state"], device=inputs["input_ids"].device).unsqueeze(0)
-
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    # Get normalized actions from model (unnorm_key=None to prevent model's denormalization)
                     actions_pred, actions_hidden_states = model.predict_action(
                         input_ids=inputs["input_ids"],
                         attention_mask=inputs["attention_mask"],
@@ -497,56 +650,147 @@ def run_episode(
                         proprio_projector=proprio_projector if cfg.use_proprio else None,
                         pointcloud=pc_tensor,
                         pointcloud_projector=pointcloud_projector if cfg.use_pointcloud_input else None,
-                        unnorm_key=cfg.unnorm_key,
+                        unnorm_key=None,  # Don't use model's denormalization
                         do_sample=False,
                         use_film=cfg.use_film,
                         action_head=action_head,
                     )
-                    actions = [actions_pred[i] for i in range(len(actions_pred))]
+                    
+                    # Denormalize actions using dataset statistics (same as training)
+                    if dataset_statistics is not None and "action" in dataset_statistics:
+                        # Convert to numpy, denormalize, convert back
+                        actions_pred_np = actions_pred.cpu().numpy()  # (chunk_size, action_dim)
+                        actions_pred_denorm = denormalize_action(actions_pred_np, dataset_statistics)
+                        actions = [actions_pred_denorm[i] for i in range(len(actions_pred_denorm))]
+                    else:
+                        # Fallback to model's denormalization if statistics not available
+                        logger.warning("Dataset statistics not available, using model's denormalization (may be inconsistent with training)")
+                        if cfg.unnorm_key and cfg.unnorm_key in model.norm_stats:
+                            action_norm_stats = model.norm_stats[cfg.unnorm_key]["action"]
+                            q01, q99 = (
+                                action_norm_stats["q01"],
+                                action_norm_stats["q99"],
+                            )
+                            actions_pred_np = actions_pred.cpu().numpy()
+                            actions_pred_denorm = (actions_pred_np + 1) * (q99 - q01) / 2 + q01
+                            actions = [actions_pred_denorm[i] for i in range(len(actions_pred_denorm))]
+                        else:
+                            actions = [actions_pred[i].cpu().numpy() for i in range(len(actions_pred))]
 
                     # Optional: visualize tracking head outputs as sequence video
                     if cfg.point_visualize and tracking_head is not None:
                         pred_tracking = tracking_head.predict_tracking(actions_hidden_states)
                         pred_seq = pred_tracking[0].detach().to(torch.float32).cpu().numpy()  # (chunk_len, num_points, dim)
+                        
+                        # Denormalize tracking deltas if statistics are available
+                        if cfg.normalize_tracking and dataset_statistics is not None:
+                            pred_seq = denormalize_tracking(pred_seq, dataset_statistics)
+                        
                         # Build cumulative sequence: initial, initial+delta1, initial+delta1+delta2, ...
-                        init_pc = pc_tensor[0].detach().to(torch.float32).cpu().numpy()
+                        # Note: init_pc is already normalized, need to denormalize it for visualization
+                        init_pc_normalized = pc_tensor[0].detach().to(torch.float32).cpu().numpy()
+                        
+                        # Denormalize initial pointcloud for visualization
+                        if cfg.normalize_pointcloud and dataset_statistics is not None:
+                            # Denormalize using inverse transformation
+                            if "pointcloud" in dataset_statistics:
+                                pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
+                                pc_std = np.array(dataset_statistics["pointcloud"]["std"])
+                                pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
+                                init_pc = init_pc_normalized.copy()
+                                init_pc[:, :3] = init_pc_normalized[:, :3] * pc_std + pc_mean
+                            else:
+                                init_pc = init_pc_normalized
+                        else:
+                            init_pc = init_pc_normalized
+                        
+                        # Now both init_pc and pred_seq (deltas) are in original space
                         cum_deltas = np.cumsum(pred_seq, axis=0)
                         pred_seq_with_input = np.concatenate([init_pc[None, ...], init_pc[None, ...] + cum_deltas], axis=0)
                         if pc_debug_dir is not None:
                             seq_video_path = pc_debug_dir / f"track_pred_{t:04d}.mp4"
                             save_sequence_video(pred_seq_with_input, seq_video_path)
             else:
-                actions = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=noisy_action_projector,
-                    use_film=cfg.use_film,
-                )
+                # get_action() uses model's unnorm_key for denormalization
+                # We need to re-normalize and then denormalize with dataset statistics
+                # actions = get_action(
+                #     cfg,
+                #     model,
+                #     observation,
+                #     task_description,
+                #     processor=processor,
+                #     action_head=action_head,
+                #     proprio_projector=proprio_projector,
+                #     noisy_action_projector=noisy_action_projector,
+                #     use_film=cfg.use_film,
+                # )
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    # Get normalized actions from model (unnorm_key=None to prevent model's denormalization)
+                    actions_pred, normalized_actions, actions_hidden_states = model.predict_action(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        pixel_values=inputs["pixel_values"].to(torch.bfloat16),
+                        proprio=proprio,
+                        proprio_projector= proprio_projector,
+                        pointcloud=None,
+                        pointcloud_projector= None,
+                        unnorm_key=None,  # Don't use model's denormalization
+                        do_sample=False,
+                        use_film=cfg.use_film,
+                        action_head=action_head,
+                    )
+                # actions_pred_np = normalized_actions.cpu().numpy()
+                actions = denormalize_action(normalized_actions, dataset_statistics)
+                
+                # If dataset statistics available, re-normalize and denormalize with correct statistics
+                # if dataset_statistics is not None and "action" in dataset_statistics:
+                #     # get_action() returns denormalized actions using model's norm_stats
+                #     # We need to use dataset_statistics instead
+                #     # First, re-normalize using model's norm_stats
+                #     if cfg.unnorm_key and cfg.unnorm_key in model.norm_stats:
+                #         print(f"Re-normalizing actions using model's norm_stats: {cfg.unnorm_key}")
+                #         action_norm_stats = model.norm_stats[cfg.unnorm_key]["action"]
+                #         q01_model = np.array(action_norm_stats["q01"])
+                #         q99_model = np.array(action_norm_stats["q99"])
+                        
+                #         # Convert actions to numpy if needed
+                #         actions_np = np.array([a.cpu().numpy() if isinstance(a, torch.Tensor) else a for a in actions])
+                        
+                #         # Re-normalize using model's statistics: normalized = 2 * (action - q01) / (q99 - q01) - 1
+                #         actions_normalized = 2.0 * (actions_np - q01_model) / (q99_model - q01_model + 1e-8) - 1.0
+                        
+                #         # Denormalize using dataset statistics
+                #         actions_denorm = denormalize_action(actions_normalized, dataset_statistics)
+                #         actions = [actions_denorm[i] for i in range(len(actions_denorm))]
+                #     else:
+                #         logger.warning("Model norm_stats not available for re-normalization")
+            
+            actions = actions
             action_queue.extend(actions)
 
         action = action_queue.popleft()
         action = process_action(action, cfg.model_family)
         obs, reward, done, info = env.step(action.tolist())
-        print('End')
         if done:
             success = True
             break
         t += 1
 
         # refresh pointcloud
-        print('Refresh pointcloud')
-        pc_np = pointcloud_from_env(
-            env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
-        )
-        pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
-        if pc_debug_dir is not None and cfg.save_pc_debug:
-            save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
-        print('Refresh pointcloud done')
+        if cfg.point_visualize :
+            print('Refresh pointcloud')
+            pc_np = pointcloud_from_env(
+                env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
+            )
+            
+            # Normalize pointcloud if statistics are available and normalization is enabled
+            if cfg.normalize_pointcloud and dataset_statistics is not None:
+                pc_np = normalize_pointcloud(pc_np, dataset_statistics)
+            
+            pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+            if pc_debug_dir is not None and cfg.save_pc_debug:
+                save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
+            print('Refresh pointcloud done')
 
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
@@ -569,6 +813,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    dataset_statistics=None,
 ):
     task = task_suite.get_task(task_id)
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
@@ -602,6 +847,7 @@ def run_task(
             log_file,
             pointcloud_projector,
             tracking_head,
+            dataset_statistics,
         )
         task_episodes += 1
         total_episodes += 1
@@ -638,6 +884,132 @@ def run_task(
 def eval_libero(cfg: GenerateConfig) -> float:
     validate_config(cfg)
     set_seed_everywhere(cfg.seed)
+    
+    # Load action_chunk_size from checkpoint if available
+    global NUM_ACTIONS_CHUNK
+    if cfg.pretrained_checkpoint and os.path.isdir(cfg.pretrained_checkpoint):
+        args_config_path = Path(cfg.pretrained_checkpoint) / "args_config.json"
+        if args_config_path.exists():
+            with open(args_config_path, "r") as f:
+                saved_args = json.load(f)
+                
+                # Load action_chunk_size from checkpoint
+                if "action_chunk_size" in saved_args and saved_args["action_chunk_size"] is not None:
+                    checkpoint_action_chunk_size = saved_args["action_chunk_size"]
+                    logger.info(f"Loading action_chunk_size from checkpoint: {checkpoint_action_chunk_size}")
+                    NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    # Update the constant in all relevant modules
+                    import prismatic.vla.constants as constants_module
+                    constants_module.NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    import prismatic.models.action_heads as action_heads_module
+                    action_heads_module.NUM_ACTIONS_CHUNK = checkpoint_action_chunk_size
+                    
+                    # Override cfg.action_chunk_size if user mistakenly provided it
+                    if cfg.action_chunk_size is not None and cfg.action_chunk_size != checkpoint_action_chunk_size:
+                        logger.warning(
+                            f"Ignoring command-line action_chunk_size={cfg.action_chunk_size}, "
+                            f"using checkpoint value={checkpoint_action_chunk_size}"
+                        )
+                    cfg.action_chunk_size = checkpoint_action_chunk_size
+        else:
+            # No args_config.json found, use command-line value if provided
+            if cfg.action_chunk_size is not None:
+                logger.info(f"Overriding NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK} -> {cfg.action_chunk_size}")
+                NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+                
+                # Update the constant in all relevant modules
+                import prismatic.vla.constants as constants_module
+                constants_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+                
+                import prismatic.models.action_heads as action_heads_module
+                action_heads_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+    elif cfg.action_chunk_size is not None:
+        # Not a directory checkpoint, use command-line value if provided
+        logger.info(f"Overriding NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK} -> {cfg.action_chunk_size}")
+        NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+        
+        # Update the constant in all relevant modules
+        import prismatic.vla.constants as constants_module
+        constants_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+        
+        import prismatic.models.action_heads as action_heads_module
+        action_heads_module.NUM_ACTIONS_CHUNK = cfg.action_chunk_size
+    
+    # Print detected constants
+    logger.info(
+        f"Detected constants:\n"
+        f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
+        f"\tACTION_DIM: {ACTION_DIM}"
+    )
+    
+    # Set num_open_loop_steps to match NUM_ACTIONS_CHUNK if not explicitly set
+    if cfg.num_open_loop_steps == 8 and NUM_ACTIONS_CHUNK != 8:
+        logger.info(f"Setting num_open_loop_steps to match NUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}")
+        cfg.num_open_loop_steps = NUM_ACTIONS_CHUNK
+    
+    # Load dataset statistics for normalization/denormalization
+    dataset_statistics = None
+    if cfg.precomputed_statistics_path:
+        stats_path = Path(cfg.precomputed_statistics_path)
+        if stats_path.exists():
+            logger.info(f"Loading dataset statistics from {stats_path}")
+            with open(stats_path, "r") as f:
+                loaded_stats = json.load(f)
+            
+            # Check if it's in RLDS format {dataset_name: {pointcloud: ...}} or flat format {pointcloud: ...}
+            if cfg.task_suite_name in loaded_stats:
+                # RLDS format
+                dataset_statistics = loaded_stats[cfg.task_suite_name]
+            elif "pointcloud" in loaded_stats or "tracking" in loaded_stats:
+                # Flat format - use directly
+                dataset_statistics = loaded_stats
+            else:
+                logger.warning(f"Could not find pointcloud/tracking statistics in {stats_path}")
+            
+            if dataset_statistics:
+                logger.info("✓ Dataset statistics loaded successfully")
+                if "action" in dataset_statistics:
+                    action_q01 = dataset_statistics["action"]["q01"]
+                    action_q99 = dataset_statistics["action"]["q99"]
+                    logger.info(f"  Action q01: {action_q01}")
+                    logger.info(f"  Action q99: {action_q99}")
+                if "proprio" in dataset_statistics:
+                    proprio_q01 = dataset_statistics["proprio"]["q01"]
+                    proprio_q99 = dataset_statistics["proprio"]["q99"]
+                    logger.info(f"  Proprio q01: {proprio_q01}")
+                    logger.info(f"  Proprio q99: {proprio_q99}")
+                if "pointcloud" in dataset_statistics:
+                    pc_mean = dataset_statistics["pointcloud"]["mean"]
+                    pc_std = dataset_statistics["pointcloud"]["std"]
+                    logger.info(f"  Pointcloud mean: {pc_mean}")
+                    logger.info(f"  Pointcloud std: {pc_std}")
+                if "tracking" in dataset_statistics:
+                    track_mean = dataset_statistics["tracking"]["mean"]
+                    track_std = dataset_statistics["tracking"]["std"]
+                    logger.info(f"  Tracking mean: {track_mean}")
+                    logger.info(f"  Tracking std: {track_std}")
+        else:
+            logger.warning(f"Statistics file not found: {stats_path}")
+    elif cfg.pretrained_checkpoint and os.path.isdir(cfg.pretrained_checkpoint):
+        # Try to load from checkpoint directory
+        stats_path = Path(cfg.pretrained_checkpoint) / "dataset_statistics.json"
+        if stats_path.exists():
+            logger.info(f"Loading dataset statistics from checkpoint: {stats_path}")
+            with open(stats_path, "r") as f:
+                loaded_stats = json.load(f)
+            
+            if cfg.task_suite_name in loaded_stats:
+                dataset_statistics = loaded_stats[cfg.task_suite_name]
+            elif "pointcloud" in loaded_stats or "tracking" in loaded_stats:
+                dataset_statistics = loaded_stats
+            
+            if dataset_statistics:
+                logger.info("✓ Dataset statistics loaded from checkpoint")
+        else:
+            logger.info("No dataset statistics found in checkpoint directory")
+    
     (
         model,
         action_head,
@@ -671,6 +1043,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            dataset_statistics,
         )
 
     final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0

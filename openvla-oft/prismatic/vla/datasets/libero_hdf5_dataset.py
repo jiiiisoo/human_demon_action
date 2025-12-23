@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import tqdm
 from PIL import Image
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
@@ -66,6 +67,7 @@ class LIBEROBatchTransform:
     use_proprio: bool = False
     use_pointcloud_input: bool = False
     use_tracking_head: bool = False
+    tracking_use_pointcloud_input: bool = False
     
     def __call__(self, libero_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -193,6 +195,7 @@ class LIBEROHdf5Dataset(Dataset):
         normalize_pointcloud: bool = True,
         normalize_tracking: bool = True,
         precomputed_statistics_path: Optional[Path] = None,
+        filename: str = "vertex_tracks_face_uniform.npy",
     ) -> None:
         """
         Args:
@@ -227,6 +230,7 @@ class LIBEROHdf5Dataset(Dataset):
         self.should_normalize_pointcloud = normalize_pointcloud
         self.should_normalize_tracking = normalize_tracking
         self.precomputed_statistics_path = Path(precomputed_statistics_path) if precomputed_statistics_path else None
+        self.filename = filename
         
         # Find all HDF5 files in the directory
         self.hdf5_files = sorted(glob.glob(str(self.data_dir / "*_demo.hdf5")))
@@ -269,6 +273,50 @@ class LIBEROHdf5Dataset(Dataset):
         else:
             print("  Computing dataset statistics (this may take a while)...")
             self._compute_statistics()
+
+    def _augment_image_np(self, img: np.ndarray, seed: int) -> np.ndarray:
+        """
+        Apply augmentations with deterministic RNG (per-sample seed) to match RLDS order:
+        resize -> random_resized_crop -> color jitter.
+        """
+        rng = np.random.RandomState(seed)
+        pil_img = Image.fromarray(img)
+
+        # 1) Resize to target resolution (RLDS decode_and_resize)
+        pil_img = pil_img.resize(self.resize_resolution[::-1], resample=Image.BILINEAR)
+
+        # 2) RandomResizedCrop with scale=0.9, ratio=1.0
+        w, h = pil_img.size
+        scale = 0.9
+        crop_size = int(round(scale * min(w, h)))
+        crop_h = crop_w = max(1, crop_size)
+        if w == crop_w:
+            j = 0
+        else:
+            j = rng.randint(0, w - crop_w + 1)
+        if h == crop_h:
+            i = 0
+        else:
+            i = rng.randint(0, h - crop_h + 1)
+        pil_img = TF.resized_crop(pil_img, top=i, left=j, height=crop_h, width=crop_w, size=(h, w), antialias=True)
+
+        # 3) Color jitter
+        b_factor = 1.0 + rng.uniform(-0.2, 0.2)  # brightness delta 0.2
+        c_factor = rng.uniform(0.8, 1.2)          # contrast
+        s_factor = rng.uniform(0.8, 1.2)          # saturation
+        h_factor = rng.uniform(-0.05, 0.05)       # hue
+        pil_img = TF.adjust_brightness(pil_img, b_factor)
+        pil_img = TF.adjust_contrast(pil_img, c_factor)
+        pil_img = TF.adjust_saturation(pil_img, s_factor)
+        pil_img = TF.adjust_hue(pil_img, h_factor)
+
+        return np.array(pil_img, dtype=np.uint8)
+
+    def _augment_observation_images(self, observation: Dict[str, Any], seed: int) -> None:
+        """Apply image augmentations in-place to primary (and wrist if present) images."""
+        observation["image_primary"] = self._augment_image_np(observation["image_primary"], seed)
+        if self.use_wrist_image and "image_wrist" in observation:
+            observation["image_wrist"] = self._augment_image_np(observation["image_wrist"], seed + 1)
         
     def _build_episode_index(self):
         """Build an index of all episodes across all HDF5 files."""
@@ -358,7 +406,7 @@ class LIBEROHdf5Dataset(Dataset):
             
             # Load ALL tracking data from tracking file
             if self.tracking_tracks_root and ep_info["point_cloud_id"]:
-                track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / "vertex_tracks_face_uniform.npy"
+                track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / self.filename
                 if track_file.exists():
                     try:
                         tracks = np.load(track_file)  # (T, num_points, 3)
@@ -603,6 +651,31 @@ class LIBEROHdf5Dataset(Dataset):
         
         return denormalized
     
+    def normalize_proprio(self, proprio: np.ndarray) -> np.ndarray:
+        """
+        Normalize proprioceptive state using BOUNDS_Q99 method (same as action normalization).
+        Maps [q01, q99] -> [-1, 1]
+        
+        Args:
+            proprio: np.ndarray of shape (proprio_dim,)
+        
+        Returns:
+            Normalized proprio of same shape
+        """
+        if "proprio" not in self._statistics_data:
+            return proprio
+        
+        q01 = np.array(self._statistics_data["proprio"]["q01"])
+        q99 = np.array(self._statistics_data["proprio"]["q99"])
+        
+        # BOUNDS_Q99: [q01, q99] -> [-1, 1]
+        normalized = 2.0 * (proprio - q01) / (q99 - q01 + 1e-8) - 1.0
+        
+        # Clip to [-1, 1] for safety
+        normalized = np.clip(normalized, -1.0, 1.0)
+        
+        return normalized
+    
     def denormalize_tracking(self, tracking: np.ndarray) -> np.ndarray:
         """
         Denormalize tracking data back to original scale.
@@ -647,13 +720,13 @@ class LIBEROHdf5Dataset(Dataset):
         
         # Load primary image (agentview)
         image_primary = demo_grp["obs"]["agentview_rgb"][frame_idx]  # (H, W, 3)
+        image_primary = image_primary[::-1, ::-1]  # 180 degree rotation
         
         # Load wrist image if needed
         if self.use_wrist_image and "eye_in_hand_rgb" in demo_grp["obs"]:
             image_wrist = demo_grp["obs"]["eye_in_hand_rgb"][frame_idx]  # (H, W, 3)
-        else:
-            image_wrist = np.zeros_like(image_primary)
-        
+            image_wrist = image_wrist[::-1, ::-1]  # 180 degree rotation
+
         # Load proprioception: [gripper_qpos(2), ee_pos(3), ee_ori(3)] = 8D
         gripper_states = demo_grp["obs"]["gripper_states"][frame_idx]  # (2,)
         ee_states = demo_grp["obs"]["ee_states"][frame_idx]  # (6,)
@@ -669,12 +742,19 @@ class LIBEROHdf5Dataset(Dataset):
         actions = np.stack(actions, axis=0)  # (action_chunk_size, action_dim)
         
         # Build observation dict
-        observation = {
-            "image_primary": image_primary,
-            "image_wrist": image_wrist,
-            "proprio": proprio,
-            "timestep": np.array([frame_idx], dtype=np.int32),
-        }
+        if self.use_wrist_image:
+            observation = {
+                "image_primary": image_primary,
+                "image_wrist": image_wrist,
+                "proprio": proprio,
+                "timestep": np.array([frame_idx], dtype=np.int32),
+            }
+        else:
+            observation = {
+                "image_primary": image_primary,
+                "proprio": proprio,
+                "timestep": np.array([frame_idx], dtype=np.int32),
+            }
         
         # Add episode_name for external data loading (point clouds, tracks)
         observation["episode_name"] = ep_info["point_cloud_id"]
@@ -682,32 +762,38 @@ class LIBEROHdf5Dataset(Dataset):
         # Load tracking data from tracking file if available
         pointcloud = None
         tracking_deltas = None
-        
-        if self.tracking_tracks_root and ep_info["point_cloud_id"]:
-            track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / "vertex_tracks_face_uniform.npy"
+        load_pointcloud = bool(getattr(self.batch_transform, "use_pointcloud_input", False)) or bool(
+            getattr(self.batch_transform, "tracking_use_pointcloud_input", False)
+        )
+        load_tracking = bool(getattr(self.batch_transform, "use_tracking_head", False))
+
+        if (load_pointcloud or load_tracking) and self.tracking_tracks_root and ep_info["point_cloud_id"]:
+            track_file = self.tracking_tracks_root / ep_info["point_cloud_id"] / self.filename
             if track_file.exists():
                 tracks = np.load(track_file)  # (T, num_points, 3)
-                
-                # Initial pointcloud (for both VLA input and tracking head)
-                # Use tracks[frame_idx] as the current state
-                # Note: frame_idx is guaranteed to be valid by _build_frame_index()
-                pointcloud = tracks[frame_idx]  # (num_points, 3)
-                
-                # Tracking deltas for action chunk
-                # If actions are frame_idx to frame_idx+chunk_size-1,
-                # tracking deltas are tracks[frame_idx+1] - tracks[frame_idx], 
-                #                    tracks[frame_idx+2] - tracks[frame_idx+1], ...
-                tracking_deltas = []
-                for offset in range(self.action_chunk_size):
-                    t_curr = frame_idx + offset
-                    t_next = t_curr + 1
-                    
-                    # Both t_curr and t_next are guaranteed to be in bounds
-                    # because frame_idx + action_chunk_size <= num_frames < len(tracks)
-                    delta = tracks[t_next] - tracks[t_curr]  # (num_points, 3)
-                    tracking_deltas.append(delta)
-                
-                tracking_deltas = np.stack(tracking_deltas, axis=0)  # (action_chunk_size, num_points, 3)
+
+                if load_pointcloud:
+                    # Initial pointcloud (for both VLA input and tracking head)
+                    # Use tracks[frame_idx] as the current state
+                    # Note: frame_idx is guaranteed to be valid by _build_frame_index()
+                    pointcloud = tracks[frame_idx]  # (num_points, 3)
+
+                if load_tracking:
+                    # Tracking deltas for action chunk
+                    # If actions are frame_idx to frame_idx+chunk_size-1,
+                    # tracking deltas are tracks[frame_idx+1] - tracks[frame_idx],
+                    #                    tracks[frame_idx+2] - tracks[frame_idx+1], ...
+                    tracking_deltas = []
+                    for offset in range(self.action_chunk_size):
+                        t_curr = frame_idx + offset
+                        t_next = t_curr + 1
+
+                        # Both t_curr and t_next are guaranteed to be in bounds
+                        # because frame_idx + action_chunk_size <= num_frames < len(tracks)
+                        delta = tracks[t_next] - tracks[t_curr]  # (num_points, 3)
+                        tracking_deltas.append(delta)
+
+                    tracking_deltas = np.stack(tracking_deltas, axis=0)  # (action_chunk_size, num_points, 3)
         
         # Build task dict
         task = {
@@ -744,6 +830,12 @@ class LIBEROHdf5Dataset(Dataset):
         with h5py.File(ep_info["hdf5_path"], "r") as f:
             demo_grp = f["data"][ep_info["demo_name"]]
             frame_data = self._load_frame(f, demo_grp, frame_idx, ep_info)
+
+        # Apply image augmentations (train only)
+        if self.train and self.image_aug:
+            # Use deterministic seed per-sample for reproducibility
+            aug_seed = self.seed + idx
+            self._augment_observation_images(frame_data["observation"], aug_seed)
         
         # Apply normalization BEFORE batch transform
         # This way we normalize the raw numpy data before tensorization
@@ -751,15 +843,18 @@ class LIBEROHdf5Dataset(Dataset):
         # Normalize actions using BOUNDS_Q99 (same as RLDS)
         frame_data["action"] = self.normalize_action(frame_data["action"])
         
-        # if self.should_normalize_pointcloud and "pointcloud" in frame_data:
-        pc = frame_data["pointcloud"]
-        # if pc is not None:
-        frame_data["pointcloud"] = self.normalize_pointcloud(pc)
-        
-        # if self.should_normalize_tracking and "tracking" in frame_data:
-        tracking = frame_data["tracking"]
-            # if tracking is not None:
-        frame_data["tracking"] = self.normalize_tracking(tracking)
+        # Normalize proprioceptive state using BOUNDS_Q99
+        proprio = frame_data["observation"]["proprio"]
+        frame_data["observation"]["proprio"] = self.normalize_proprio(proprio)
+
+        if self.tracking_tracks_root:
+            pc = frame_data["pointcloud"]
+            if pc is not None:
+                frame_data["pointcloud"] = self.normalize_pointcloud(pc)
+            
+            tracking = frame_data["tracking"]
+            if tracking is not None:
+                frame_data["tracking"] = self.normalize_tracking(tracking)
         
         # Apply batch transform (converts to tensors)
         transformed = self.batch_transform(frame_data)
@@ -791,6 +886,7 @@ def make_libero_hdf5_datasets(
     normalize_pointcloud: bool = True,
     normalize_tracking: bool = True,
     precomputed_statistics_path: Optional[Path] = None,
+    filename: str = "vertex_tracks_face_uniform.npy",
 ) -> Tuple[LIBEROHdf5Dataset, Optional[LIBEROHdf5Dataset]]:
     """
     Create train and (optionally) validation datasets from LIBERO HDF5 files.
@@ -831,6 +927,7 @@ def make_libero_hdf5_datasets(
         normalize_pointcloud=normalize_pointcloud,
         normalize_tracking=normalize_tracking,
         precomputed_statistics_path=precomputed_statistics_path,
+        filename=filename,
     )
     
     val_dataset = None
@@ -851,6 +948,7 @@ def make_libero_hdf5_datasets(
             normalize_pointcloud=normalize_pointcloud,
             normalize_tracking=normalize_tracking,
             precomputed_statistics_path=precomputed_statistics_path,
+            filename=filename,
         )
     
     return train_dataset, val_dataset
@@ -889,4 +987,3 @@ if __name__ == "__main__":
             break
     
     print("\nDataset test complete!")
-
