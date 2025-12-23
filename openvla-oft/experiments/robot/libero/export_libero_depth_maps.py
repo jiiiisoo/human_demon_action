@@ -53,12 +53,18 @@ def _save_depth_png(depth_m: np.ndarray, out_path: Path):
     cv2.imwrite(str(out_path), depth_mm)
 
 
+def _save_depth_npy(depth_m: np.ndarray, out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_path, depth_m.astype(np.float32))
+
+
 def _replay_demo(
     env,
     demo_data,
     depth_key: str,
     out_dir: Path,
     stop_on_done: bool,
+    save_npy: bool,
 ):
     actions = demo_data["actions"][()]
     states = demo_data["states"][()]
@@ -76,6 +82,9 @@ def _replay_demo(
         depth = obs[depth_key]
         out_path = out_dir / f"frame_{step_idx:04d}.png"
         _save_depth_png(depth, out_path)
+        if save_npy:
+            npy_path = out_dir / f"frame_{step_idx:04d}.npy"
+            _save_depth_npy(depth, npy_path)
 
         obs, _, done, _ = env.step(action.tolist())
         if stop_on_done and done:
@@ -121,6 +130,7 @@ def main(args):
                     depth_key=depth_key,
                     out_dir=demo_out_dir,
                     stop_on_done=args.stop_on_done,
+                    save_npy=args.save_npy,
                 )
 
         env.close()
@@ -181,5 +191,10 @@ if __name__ == "__main__":
         "--skip_existing",
         action="store_true",
         help="Skip demos if output directory already exists.",
+    )
+    parser.add_argument(
+        "--save_npy",
+        action="store_true",
+        help="Also save float32 depth maps as .npy in the same folder.",
     )
     main(parser.parse_args())
