@@ -302,6 +302,123 @@ class PointTrackingHeadWithPointInput(nn.Module):
         tracking = self.fusion_mlp(fusion)  # (B, T, N, tracking_dim)
         return tracking
 
+class PointTrackingHeadParallel(nn.Module):
+    """Parallel point tracking with transformer."""
+
+    def __init__(
+        self,
+        input_dim: int = 4096,
+        hidden_dim: int = 512,
+        num_points: int = 64,
+        tracking_dim: int = 3,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_points = num_points
+        self.tracking_dim = tracking_dim
+        self.hidden_dim = hidden_dim
+
+        # Input embeddings
+        self.point_embed = nn.Linear(tracking_dim, hidden_dim)
+        self.action_embed = nn.Linear(input_dim * ACTION_DIM, hidden_dim)  # 7*D -> H
+        
+        # Positional embeddings
+        self.point_idx_embed = nn.Parameter(torch.randn(1, num_points, hidden_dim) * 0.02)
+        self.time_embed = nn.Parameter(torch.randn(1, NUM_ACTIONS_CHUNK, hidden_dim) * 0.02)
+        
+        # Type embeddings
+        self.type_embed = nn.ParameterDict({
+            'p0': nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02),
+            'action': nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02),
+            'query': nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02),
+        })
+
+        # Transformer
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+            ),
+            num_layers=num_layers,
+        )
+
+        self.output_proj = nn.Linear(hidden_dim, tracking_dim)
+
+    def predict_tracking(
+        self, 
+        actions_hidden_states: torch.Tensor,  # (B, T * 7, D)
+        pointcloud: torch.Tensor,              # (B, N, 3)
+    ) -> torch.Tensor:
+        if pointcloud is None:
+            raise ValueError("PointTrackingHeadParallel requires a pointcloud input.")
+            
+        B = actions_hidden_states.shape[0]
+        T = NUM_ACTIONS_CHUNK
+        N = self.num_points
+
+        # === Embed P0 ===
+        p0 = self.point_embed(pointcloud) + self.point_idx_embed + self.type_embed['p0']
+        # (B, N, H)
+
+        # === Embed Actions ===
+        actions = actions_hidden_states.reshape(B, T, -1)  # (B, T, 7*D)
+        actions = self.action_embed(actions) + self.time_embed + self.type_embed['action']
+        # (B, T, H)
+
+        # === Create Queries ===
+        queries = self.point_idx_embed.unsqueeze(1).expand(B, T, N, -1).clone()
+        queries = queries + self.time_embed.unsqueeze(2)
+        queries = queries + self.type_embed['query']
+        queries = queries.reshape(B, T * N, -1)
+        # (B, T*N, H)
+
+        # === Build sequence: [P0] [Actions] [Queries] ===
+        seq = torch.cat([p0, actions, queries], dim=1)
+        # (B, N + T + T*N, H)
+
+        # === Causal mask ===
+        mask = self._build_mask(N, T, seq.device)
+
+        # === Forward ===
+        out = self.transformer(seq, mask=mask)
+
+        # === Extract & reshape ===
+        query_out = out[:, N + T:, :]
+        query_out = query_out.reshape(B, T, N, -1)
+        
+        return self.output_proj(query_out)  # (B, T, N, 3)
+
+    def _build_mask(self, N: int, T: int, device) -> torch.Tensor:
+        total = N + T + T * N
+        # True = 막힘 (attend 불가), False = 통과 (attend 가능)
+        mask = torch.ones((total, total), dtype=torch.bool, device=device)
+        
+        # P0 ↔ P0
+        mask[:N, :N] = False
+        
+        # Action_t sees: P0, Action_1..t
+        for t in range(T):
+            idx = N + t
+            mask[idx, :N] = False
+            mask[idx, N:N+t+1] = False
+        
+        # Query_t sees: P0, Action_1..t, Query_1..t
+        for t in range(T):
+            q_start = N + T + t * N
+            q_end = q_start + N
+            
+            mask[q_start:q_end, :N] = False
+            mask[q_start:q_end, N:N+t+1] = False
+            mask[q_start:q_end, N+T:q_end] = False
+        
+        return mask
+
 # class PointTrackingHead(nn.Module):
 #     def __init__(
 #         self,

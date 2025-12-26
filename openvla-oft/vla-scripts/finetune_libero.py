@@ -52,7 +52,13 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, PointTrackingHead, PointTrackingHeadWithPointInput
+from prismatic.models.action_heads import (
+    DiffusionActionHead,
+    L1RegressionActionHead,
+    PointTrackingHead,
+    PointTrackingHeadParallel,
+    PointTrackingHeadWithPointInput,
+)
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -115,6 +121,7 @@ class FinetuneConfig:
     tracking_num_points: int = 1                     # Number of tracked points per timestep
     tracking_hidden_dim: int = 0                     # Hidden dimension for tracking head MLP (0 => use llm_dim)
     tracking_num_blocks: int = 2                     # Number of MLP blocks for tracking head
+    tracking_head_type: str = "mlp"                  # Tracking head type: "mlp", "with_point_input", or "parallel"
     tracking_loss_weight: float = 1.0                # Scaling factor for tracking loss term
     tracking_label_key: Optional[str] = None         # Dot-delimited key into RLDS batch for point tracking labels
     tracking_use_point_features: bool = False        # If True, fuse base pointcloud into tracking head
@@ -340,6 +347,7 @@ def run_forward_pass(
     capture_tracking: bool = False,
     tracking_use_point_features: bool = False,
     tracking_use_pointcloud_input: bool = False,
+    tracking_head_type: str = "mlp",
     tracking_num_points: Optional[int] = None,
     tracking_dim: Optional[int] = None,
     train_dataset=None,
@@ -520,9 +528,14 @@ def run_forward_pass(
             if tracking_head is None:
                 raise ValueError("Tracking head is required but not provided.")
             tracking_pointcloud_for_head = None
-            if tracking_use_point_features:
+            if tracking_use_point_features or tracking_head_type in ("with_point_input", "parallel"):
                 if tracking_use_pointcloud_input and pointcloud_input is not None:
                     tracking_pointcloud_for_head = _pad_or_trim_tracking_pc(pointcloud_input)
+            if tracking_head_type in ("with_point_input", "parallel") and tracking_pointcloud_for_head is None:
+                raise ValueError(
+                    "PointTrackingHeadWithPointInput/PointTrackingHeadParallel requires pointcloud input. "
+                    "Set tracking_use_pointcloud_input=True and provide pointcloud_input."
+                )
             predicted_tracking = tracking_head.module.predict_tracking(
                 actions_hidden_states,
                 pointcloud=tracking_pointcloud_for_head,
@@ -1135,6 +1148,7 @@ def run_validation(
                 capture_tracking=False,
                 tracking_use_point_features=cfg.tracking_use_point_features,
                 tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+                tracking_head_type=cfg.tracking_head_type,
                 tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
                 tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
                 train_dataset=train_dataset,
@@ -1191,9 +1205,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         if cfg.tracking_use_pointcloud_input:
             # tracking_use_pointcloud_input means passing pointcloud to tracking head
             # This is independent from use_pointcloud_input (which adds pointcloud to VLA input)
-            assert cfg.tracking_use_point_features, (
+            assert cfg.tracking_use_point_features or cfg.tracking_head_type in ("with_point_input", "parallel"), (
                 "tracking_use_pointcloud_input=True requires tracking_use_point_features=True "
-                "(PointTrackingHeadWithPointInput architecture)."
+                "or tracking_head_type=with_point_input/parallel."
             )
     if cfg.save_tracking_viz:
         assert cfg.use_tracking_head, "save_tracking_viz requires use_tracking_head=True."
@@ -1475,17 +1489,36 @@ def finetune(cfg: FinetuneConfig) -> None:
         tracking_point_hidden_dim = (
             cfg.tracking_point_hidden_dim if cfg.tracking_point_hidden_dim > 0 else tracking_hidden_dim
         )
-        tracking_head_cls = PointTrackingHeadWithPointInput if cfg.tracking_use_point_features else PointTrackingHead
-        tracking_module_args = {
-            "input_dim": vla.module.llm_dim,
-            "hidden_dim": tracking_hidden_dim,
-            "point_hidden_dim": tracking_point_hidden_dim,
-            "num_points": cfg.tracking_num_points,
-            "tracking_dim": cfg.tracking_dim,
-            "num_blocks": cfg.tracking_num_blocks,
-        }
-        if not cfg.tracking_use_point_features:
-            tracking_module_args.pop("point_hidden_dim")
+        if cfg.tracking_head_type == "parallel":
+            tracking_head_cls = PointTrackingHeadParallel
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+            }
+        elif cfg.tracking_head_type == "with_point_input":
+            tracking_head_cls = PointTrackingHeadWithPointInput
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "point_hidden_dim": tracking_point_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+                "num_blocks": cfg.tracking_num_blocks,
+            }
+        else:
+            tracking_head_cls = PointTrackingHeadWithPointInput if cfg.tracking_use_point_features else PointTrackingHead
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "point_hidden_dim": tracking_point_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+                "num_blocks": cfg.tracking_num_blocks,
+            }
+            if not cfg.tracking_use_point_features:
+                tracking_module_args.pop("point_hidden_dim")
         tracking_head = init_module(
             tracking_head_cls,
             "tracking_head",
@@ -1722,6 +1755,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 capture_tracking=capture_tracking,
                 tracking_use_point_features=cfg.tracking_use_point_features,
                 tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+                tracking_head_type=cfg.tracking_head_type,
                 tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
                 tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
                 train_dataset=train_dataset,
