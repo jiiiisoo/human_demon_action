@@ -248,7 +248,7 @@ class PointTrackingHead(nn.Module):
         tracking = tracking_flat.reshape(batch_size, NUM_ACTIONS_CHUNK, self.num_points, self.tracking_dim)
         return tracking
 
-
+## mlp
 class PointTrackingHeadWithPointInput(nn.Module):
     """Predicts per-frame point tracking targets conditioning on action states and base pointcloud."""
 
@@ -302,14 +302,237 @@ class PointTrackingHeadWithPointInput(nn.Module):
         tracking = self.fusion_mlp(fusion)  # (B, T, N, tracking_dim)
         return tracking
 
-class PointTrackingHeadParallel(nn.Module):
-    """Parallel point tracking with transformer."""
+## pointnet
+# class PointTrackingHeadWithPointInput(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim=4096,
+#         hidden_dim=1024,
+#         point_hidden_dim=1024,
+#         num_points=1024,
+#         tracking_dim=3,
+#         num_blocks: int = 2,
+#     ):
+#         super().__init__()
+#         self.num_points = num_points
+#         self.tracking_dim = tracking_dim
+        
+#         # === PointNet-style encoder ===
+#         self.point_local = nn.Sequential(
+#             nn.Linear(tracking_dim, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#         )
+#         self.point_global = nn.Sequential(
+#             nn.Linear(hidden_dim, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#         )
+        
+#         # Action encoder (기존과 동일)
+#         self.ctx_mlp = MLPResNet(
+#             num_blocks=num_blocks,
+#             input_dim=input_dim * ACTION_DIM,
+#             hidden_dim=hidden_dim,
+#             output_dim=hidden_dim,
+#         )
+        
+#         # Fusion (기존과 동일)
+#         self.fusion_mlp = nn.Sequential(
+#             nn.Linear(hidden_dim * 2, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, tracking_dim),
+#         )
 
+#     def predict_tracking(self, actions_hidden_states, pointcloud):
+#         if pointcloud is None:
+#             raise ValueError("Requires pointcloud input.")
+        
+#         batch_size = actions_hidden_states.shape[0]
+        
+#         # === PointNet-style encoding ===
+#         local_feat = self.point_local(pointcloud)  # (B, N, H)
+#         global_feat = local_feat.max(dim=1, keepdim=True)[0]  # (B, 1, H)
+#         global_feat = self.point_global(global_feat)  # (B, 1, H)
+#         point_feat = local_feat + global_feat  # (B, N, H) - 각 point가 scene context를 앎
+        
+#         # === Action encoding ===
+#         ctx = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+#         ctx_feat = self.ctx_mlp(ctx)  # (B, T, H)
+        
+#         # === Fusion ===
+#         ctx_expanded = ctx_feat.unsqueeze(2).expand(-1, -1, self.num_points, -1)  # (B, T, N, H)
+#         pt_expanded = point_feat.unsqueeze(1).expand(-1, NUM_ACTIONS_CHUNK, -1, -1)  # (B, T, N, H)
+#         fusion = torch.cat([ctx_expanded, pt_expanded], dim=-1)  # (B, T, N, 2H)
+        
+#         tracking = self.fusion_mlp(fusion)  # (B, T, N, 3)
+#         return tracking
+
+## point transformer encoder
+# class PointTrackingHeadWithPointInput(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim=4096,
+#         hidden_dim=1024,
+#         point_hidden_dim=1024,
+#         num_points=1024,
+#         tracking_dim=3,
+#         num_blocks: int = 2,
+#         point_encoder_layers: int = 2,
+#         point_encoder_heads: int = 8,
+#     ):
+#         super().__init__()
+#         self.num_points = num_points
+#         self.tracking_dim = tracking_dim
+
+#         # === Point Encoder (Transformer로 scene 이해) ===
+#         self.point_proj = nn.Linear(tracking_dim, hidden_dim)
+#         self.point_transformer = nn.TransformerEncoder(
+#             nn.TransformerEncoderLayer(
+#                 d_model=hidden_dim,
+#                 nhead=point_encoder_heads,
+#                 dim_feedforward=hidden_dim * 4,
+#                 activation="gelu",
+#                 batch_first=True,
+#             ),
+#             num_layers=point_encoder_layers,
+#         )
+
+#         # Action encoder (기존과 동일)
+#         self.ctx_mlp = MLPResNet(
+#             num_blocks=num_blocks,
+#             input_dim=input_dim * ACTION_DIM,
+#             hidden_dim=hidden_dim,
+#             output_dim=hidden_dim,
+#         )
+
+#         # Fusion (기존과 동일)
+#         self.fusion_mlp = nn.Sequential(
+#             nn.Linear(hidden_dim * 2, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, tracking_dim),
+#         )
+
+#     def predict_tracking(self, actions_hidden_states, pointcloud):
+#         if pointcloud is None:
+#             raise ValueError("Requires pointcloud input.")
+        
+#         batch_size = actions_hidden_states.shape[0]
+
+#         # === Point encoding (서로 attention) ===
+#         point_feat = self.point_proj(pointcloud)  # (B, N, H)
+#         point_feat = self.point_transformer(point_feat)  # (B, N, H) - Point끼리 서로 봄
+
+#         # === Action encoding ===
+#         ctx = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+#         ctx_feat = self.ctx_mlp(ctx)  # (B, T, H)
+
+#         # === Fusion ===
+#         ctx_expanded = ctx_feat.unsqueeze(2).expand(-1, -1, self.num_points, -1)  # (B, T, N, H)
+#         pt_expanded = point_feat.unsqueeze(1).expand(-1, NUM_ACTIONS_CHUNK, -1, -1)  # (B, T, N, H)
+#         fusion = torch.cat([ctx_expanded, pt_expanded], dim=-1)  # (B, T, N, 2H)
+        
+#         tracking = self.fusion_mlp(fusion)  # (B, T, N, 3)
+#         return tracking
+
+## point transformer encoder fusion
+# class PointTrackingHeadWithPointInput(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim: int = 4096,
+#         hidden_dim: int = 1024,
+#         num_points: int = 1024,
+#         tracking_dim: int = 3,
+#         num_layers: int = 4,
+#         num_heads: int = 8,
+#         dropout: float = 0.1,
+#     ):
+#         super().__init__()
+#         self.num_points = num_points
+#         self.hidden_dim = hidden_dim
+
+#         # === Point Encoder (Transformer로 scene 이해) ===
+#         self.point_proj = nn.Linear(tracking_dim, hidden_dim)
+#         self.point_transformer = nn.TransformerEncoder(
+#             nn.TransformerEncoderLayer(
+#                 d_model=hidden_dim,
+#                 nhead=num_heads,
+#                 dim_feedforward=hidden_dim * 4,
+#                 dropout=dropout,
+#                 batch_first=True,
+#             ),
+#             num_layers=2,  # Point끼리만 보는 건 가볍게
+#         )
+        
+#         # === Action Encoder ===
+#         self.action_embed = MLPResNet(
+#             num_blocks=2,
+#             input_dim=input_dim * ACTION_DIM,
+#             hidden_dim=hidden_dim,
+#             output_dim=hidden_dim,
+#         )
+
+#         # Positional embeddings
+#         self.point_idx_embed = nn.Parameter(torch.randn(1, num_points, hidden_dim) * 0.02)
+#         self.time_embed = nn.Parameter(torch.randn(1, NUM_ACTIONS_CHUNK, hidden_dim) * 0.02)
+
+#         # === Main Transformer (P0 + Actions fusion) ===
+#         self.transformer = nn.TransformerEncoder(
+#             nn.TransformerEncoderLayer(
+#                 d_model=hidden_dim,
+#                 nhead=num_heads,
+#                 dim_feedforward=hidden_dim * 4,
+#                 dropout=dropout,
+#                 batch_first=True,
+#             ),
+#             num_layers=num_layers,
+#         )
+
+#         # Output
+#         self.output_proj = nn.Sequential(
+#             nn.Linear(hidden_dim * 2, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, tracking_dim),
+#         )
+
+#     def predict_tracking(self, actions_hidden_states, pointcloud):
+#         B = actions_hidden_states.shape[0]
+#         T = NUM_ACTIONS_CHUNK
+#         N = self.num_points
+
+#         # === Point encoding (서로 attention) ===
+#         point_feat = self.point_proj(pointcloud)  # (B, N, H)
+#         point_feat = self.point_transformer(point_feat)  # Point끼리 서로 봄
+#         point_feat = point_feat + self.point_idx_embed
+
+#         # === Action encoding ===
+#         actions = actions_hidden_states.reshape(B, T, -1)
+#         action_feat = self.action_embed(actions) + self.time_embed
+
+#         # === Main Transformer (P0 ↔ Actions) ===
+#         seq = torch.cat([point_feat, action_feat], dim=1)  # (B, N+T, H)
+#         out = self.transformer(seq)
+        
+#         p0_out = out[:, :N, :]       # (B, N, H)
+#         action_out = out[:, N:, :]   # (B, T, H)
+
+#         # === Output ===
+#         p0_expanded = p0_out.unsqueeze(1).expand(B, T, N, -1)
+#         action_expanded = action_out.unsqueeze(2).expand(B, T, N, -1)
+        
+#         combined = torch.cat([p0_expanded, action_expanded], dim=-1)
+#         tracking = self.output_proj(combined)
+        
+#         return tracking
+
+
+## parallel : v1
+class PointTrackingHeadParallel(nn.Module):
     def __init__(
         self,
         input_dim: int = 4096,
-        hidden_dim: int = 512,
-        num_points: int = 64,
+        hidden_dim: int = 1024,
+        num_points: int = 1024,
         tracking_dim: int = 3,
         num_layers: int = 4,
         num_heads: int = 8,
@@ -317,23 +540,26 @@ class PointTrackingHeadParallel(nn.Module):
     ):
         super().__init__()
         self.num_points = num_points
-        self.tracking_dim = tracking_dim
         self.hidden_dim = hidden_dim
 
-        # Input embeddings
-        self.point_embed = nn.Linear(tracking_dim, hidden_dim)
-        self.action_embed = nn.Linear(input_dim * ACTION_DIM, hidden_dim)  # 7*D -> H
+        # 가벼운 projection
+        # self.point_embed = nn.Linear(tracking_dim, hidden_dim)
+        # self.action_embed = nn.Linear(input_dim * ACTION_DIM, hidden_dim)
+        self.point_embed = nn.Sequential(
+            nn.Linear(tracking_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.action_embed = MLPResNet(
+            num_blocks=2,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+        )
         
         # Positional embeddings
         self.point_idx_embed = nn.Parameter(torch.randn(1, num_points, hidden_dim) * 0.02)
         self.time_embed = nn.Parameter(torch.randn(1, NUM_ACTIONS_CHUNK, hidden_dim) * 0.02)
-        
-        # Type embeddings
-        self.type_embed = nn.ParameterDict({
-            'p0': nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02),
-            'action': nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02),
-            'query': nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02),
-        })
 
         # Transformer
         self.transformer = nn.TransformerEncoder(
@@ -348,76 +574,156 @@ class PointTrackingHeadParallel(nn.Module):
             num_layers=num_layers,
         )
 
-        self.output_proj = nn.Linear(hidden_dim, tracking_dim)
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, tracking_dim),
+        )
+        self._mask_cache = {}
 
-    def predict_tracking(
-        self, 
-        actions_hidden_states: torch.Tensor,  # (B, T * 7, D)
-        pointcloud: torch.Tensor,              # (B, N, 3)
-    ) -> torch.Tensor:
-        if pointcloud is None:
-            raise ValueError("PointTrackingHeadParallel requires a pointcloud input.")
-            
+    def predict_tracking(self, actions_hidden_states, pointcloud):
         B = actions_hidden_states.shape[0]
         T = NUM_ACTIONS_CHUNK
         N = self.num_points
 
-        # === Embed P0 ===
-        p0 = self.point_embed(pointcloud) + self.point_idx_embed + self.type_embed['p0']
-        # (B, N, H)
+        # === Embed ===
+        p0_feat = self.point_embed(pointcloud)  # (B, N, H)
+        p0 = p0_feat + self.point_idx_embed
 
-        # === Embed Actions ===
-        actions = actions_hidden_states.reshape(B, T, -1)  # (B, T, 7*D)
-        actions = self.action_embed(actions) + self.time_embed + self.type_embed['action']
-        # (B, T, H)
+        actions = actions_hidden_states.reshape(B, T, -1)
+        actions = self.action_embed(actions) + self.time_embed
 
-        # === Create Queries ===
-        queries = self.point_idx_embed.unsqueeze(1).expand(B, T, N, -1).clone()
-        queries = queries + self.time_embed.unsqueeze(2)
-        queries = queries + self.type_embed['query']
-        queries = queries.reshape(B, T * N, -1)
-        # (B, T*N, H)
+        # === Sequence: [P0] [Actions] ===
+        seq = torch.cat([p0, actions], dim=1)
 
-        # === Build sequence: [P0] [Actions] [Queries] ===
-        seq = torch.cat([p0, actions, queries], dim=1)
-        # (B, N + T + T*N, H)
-
-        # === Causal mask ===
-        mask = self._build_mask(N, T, seq.device)
+        # === No Mask ===
+        # mask = self._build_mask(N, T, seq.device)
 
         # === Forward ===
-        out = self.transformer(seq, mask=mask)
+        # out = self.transformer(seq, mask=mask)
+        out = self.transformer(seq)
 
-        # === Extract & reshape ===
-        query_out = out[:, N + T:, :]
-        query_out = query_out.reshape(B, T, N, -1)
+        p0_out = out[:, :N, :]      # (B, N, H)
+        action_out = out[:, N:, :]  # (B, T, H)
+
+        # === Combine and predict ===
+        # 각 (t, point) 조합에 대해 예측
+        p0_expanded = p0_out.unsqueeze(1).expand(B, T, N, -1)      # (B, T, N, H)
+        action_expanded = action_out.unsqueeze(2).expand(B, T, N, -1)  # (B, T, N, H)
         
-        return self.output_proj(query_out)  # (B, T, N, 3)
+        combined = torch.cat([p0_expanded, action_expanded], dim=-1)  # (B, T, N, 2H)
+        tracking = self.output_proj(combined)  # (B, T, N, 3)
+        return tracking
 
-    def _build_mask(self, N: int, T: int, device) -> torch.Tensor:
-        total = N + T + T * N
-        # True = 막힘 (attend 불가), False = 통과 (attend 가능)
+    def _build_mask(self, N, T, device):
+        total = N + T
         mask = torch.ones((total, total), dtype=torch.bool, device=device)
         
-        # P0 ↔ P0
+        # P0 ↔ P0 (bidirectional)
         mask[:N, :N] = False
         
-        # Action_t sees: P0, Action_1..t
-        for t in range(T):
-            idx = N + t
-            mask[idx, :N] = False
-            mask[idx, N:N+t+1] = False
+        # P0 ↔ Actions (bidirectional) - P0가 모든 action 봄
+        mask[:N, N:] = False
         
-        # Query_t sees: P0, Action_1..t, Query_1..t
+        # Actions → P0 (모든 action이 P0 봄)
+        mask[N:, :N] = False
+        
+        # Actions: causal (action t는 action 1..t만)
         for t in range(T):
-            q_start = N + T + t * N
-            q_end = q_start + N
-            
-            mask[q_start:q_end, :N] = False
-            mask[q_start:q_end, N:N+t+1] = False
-            mask[q_start:q_end, N+T:q_end] = False
+            mask[N+t, N:N+t+1] = False
         
         return mask
+
+## pointransform_transform
+# class PointTrackingHeadParallel(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim: int = 4096,
+#         hidden_dim: int = 1024,
+#         num_points: int = 1024,
+#         tracking_dim: int = 3,
+#         num_layers: int = 4,
+#         num_heads: int = 8,
+#         dropout: float = 0.1,
+#         point_encoder_layers: int = 2,
+#     ):
+#         super().__init__()
+#         self.num_points = num_points
+#         self.hidden_dim = hidden_dim
+
+#         # === Point Encoder (Transformer로 scene 이해) ===
+#         self.point_proj = nn.Linear(tracking_dim, hidden_dim)
+#         self.point_transformer = nn.TransformerEncoder(
+#             nn.TransformerEncoderLayer(
+#                 d_model=hidden_dim,
+#                 nhead=num_heads,
+#                 dim_feedforward=hidden_dim * 4,
+#                 dropout=dropout,
+#                 activation="gelu",
+#                 batch_first=True,
+#             ),
+#             num_layers=point_encoder_layers,
+#         )
+
+#         # === Action Encoder ===
+#         self.action_embed = MLPResNet(
+#             num_blocks=2,
+#             input_dim=input_dim * ACTION_DIM,
+#             hidden_dim=hidden_dim,
+#             output_dim=hidden_dim,
+#         )
+
+#         # Positional embeddings
+#         self.point_idx_embed = nn.Parameter(torch.randn(1, num_points, hidden_dim) * 0.02)
+#         self.time_embed = nn.Parameter(torch.randn(1, NUM_ACTIONS_CHUNK, hidden_dim) * 0.02)
+
+#         # === Fusion Transformer ===
+#         self.fusion_transformer = nn.TransformerEncoder(
+#             nn.TransformerEncoderLayer(
+#                 d_model=hidden_dim,
+#                 nhead=num_heads,
+#                 dim_feedforward=hidden_dim * 4,
+#                 dropout=dropout,
+#                 activation="gelu",
+#                 batch_first=True,
+#             ),
+#             num_layers=num_layers,
+#         )
+
+#         self.output_proj = nn.Sequential(
+#             nn.Linear(hidden_dim * 2, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, tracking_dim),
+#         )
+
+#     def predict_tracking(self, actions_hidden_states, pointcloud):
+#         B = actions_hidden_states.shape[0]
+#         T = NUM_ACTIONS_CHUNK
+#         N = self.num_points
+
+#         # === Point Encoding (서로 attention!) ===
+#         point_feat = self.point_proj(pointcloud)  # (B, N, H)
+#         point_feat = self.point_transformer(point_feat)  # Point끼리 서로 봄
+#         point_feat = point_feat + self.point_idx_embed
+
+#         # === Action Encoding ===
+#         actions = actions_hidden_states.reshape(B, T, -1)
+#         action_feat = self.action_embed(actions) + self.time_embed
+
+#         # === Fusion Transformer (bidirectional, no mask) ===
+#         seq = torch.cat([point_feat, action_feat], dim=1)  # (B, N+T, H)
+#         out = self.fusion_transformer(seq)  # 전부 서로 봄
+        
+#         p0_out = out[:, :N, :]      # (B, N, H)
+#         action_out = out[:, N:, :]  # (B, T, H)
+
+#         # === Output ===
+#         p0_expanded = p0_out.unsqueeze(1).expand(B, T, N, -1)      # (B, T, N, H)
+#         action_expanded = action_out.unsqueeze(2).expand(B, T, N, -1)  # (B, T, N, H)
+#         combined = torch.cat([p0_expanded, action_expanded], dim=-1)  # (B, T, N, 2H)
+#         tracking = self.output_proj(combined)  # (B, T, N, 3)
+        
+#         return tracking
 
 # class PointTrackingHead(nn.Module):
 #     def __init__(

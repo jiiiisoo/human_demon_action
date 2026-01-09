@@ -8,26 +8,31 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-export PYTHONPATH=/home/jisookim/openvla-oft/LIBERO:$PYTHONPATH
+export CUDA_VISIBLE_DEVICES=7
+export MUJOCO_GL=egl
+export MUJOCO_EGL_DEVICE_ID=7  # Use your GPU ID
+export PYOPENGL_PLATFORM=egl
+# export MUJOCO_GL=osmesa
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=/home/jisoo_kim/human_demon_action/LIBERO:$PYTHONPATH
 
-python -u experiments/robot/libero/run_libero_eval_pointcloud.py \
-    --pretrained_checkpoint /mnt/data/jisookim/openvla_finetune/track_5000_w10_new_data_hidden8192_blocks3/openvla-7b+libero_goal_no_noops+b32+lr-0.0005+lora-r32+dropout-0.0--image_aug--track_5000_w10_new_data_hidden8192_blocks3-parallel_dec--8_acts_chunk--continuous_acts--L1_regression--3rd_person_img--proprio_state--50000_chkpt \
-    --task_suite_name libero_goal \
+python experiments/robot/libero/run_libero_eval_pointcloud.py \
+    --pretrained_checkpoint /weka/jisookim/experiment/openvla/libero/ckpt/libero_long_track_1024_input_head_onlytrack_nomask_transformer_8_stride1_hidden512_blocks3_b16_aug/openvla-7b+libero_10+b16+lr-0.0005+lora-r32+dropout-0.0--image_aug--libero_long_track_1024_input_head_onlytrack_nomask_transformer_8_stride1_hidden512_blocks3_b16_aug-8_acts_chunk--3rd_person_img--proprio_state--90000_chkpt \
+    --task_suite_name libero_10 \
     --num_trials_per_task 50 \
-    --pointcloud_num_points 5000 \
-    --pointcloud_dim 3 \
-    --pointcloud_cube_half 1000000000 \
-    --use_pointcloud_input True \
+    --pointcloud_num_points 1024 \
+    --pointcloud_dim 2 \
+    --pointcloud_cube_half 1 \
+    --use_pointcloud_input False \
     --use_proprio True \
     --num_images_in_input 1 \
     --save_pc_debug False \
-    --local_log_dir /home/jisookim/openvla-oft/experiments/track_5000_w10_new_data_hidden8192_blocks3/logs_50000_chkpt \
-    --rollout_dir /home/jisookim/openvla-oft/rollouts/track_5000_w10_new_data_hidden8192_blocks3_50000_chkpt \
-    --point_visualize True \
-    --tracking_num_points 5000 \
+    --local_log_dir /weka/jisookim/experiment/openvla/libero/exp_results/openvla-oft/libero_10/libero_long_track_1024_input_head_onlytrack_nomask_transformer_8_stride1_hidden512_blocks3_b16_aug/evaluate/90k_ckpt \
+    --rollout_dir /weka/jisookim/experiment/openvla/libero/exp_results/openvla-oft/libero_10/libero_long_track_1024_input_head_onlytrack_nomask_transformer_8_stride1_hidden512_blocks3_b16_aug/evaluate/rollout/90k_ckpt \
+    --point_visualize False \
+    --tracking_num_points 1024 \
     --tracking_dim 3 \
-    --tracking_hidden_dim 8192 \
-    --tracking_num_blocks 3 \
-    --include_table True \
-    --include_wall False \
-    --table_weight 0.3
+    --action_chunk_size 8 \
+    --normalize_pointcloud True \
+    --normalize_tracking True \
+    --precomputed_statistics_path /weka/jisookim/dataset/libero/tfds/libero_10_no_noops/libero_long_statistics_1024.json
