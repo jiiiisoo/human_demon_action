@@ -191,37 +191,6 @@ def _replay_demo(
     for _ in range(10):
         obs, _, _, _ = env.step(get_libero_dummy_action("llava"))
 
-    if save_camera_params:
-        depth = obs[depth_key]
-        height, width = depth.shape
-        camera_name = depth_key.replace("_depth", "")
-        if camera_params_format == "mujoco":
-            intrinsics = _get_camera_intrinsics(env.sim, camera_name, width, height)
-            intrinsics["width"] = int(width)
-            intrinsics["height"] = int(height)
-            intrinsics["camera_name"] = camera_name
-            intrinsics["near"] = float(env.sim.model.vis.map.znear)
-            intrinsics["far"] = float(env.sim.model.vis.map.zfar)
-            _save_intrinsics_json(intrinsics, out_dir / "camera_params" / "intrinsics.json")
-        elif camera_params_format == "spatracker_v2":
-            _save_camera_npz(
-                env.sim,
-                camera_name,
-                width,
-                height,
-                out_dir / "camera_params" / "spatracker_v2.npz",
-                convert_to_opencv=False,
-            )
-        elif camera_params_format == "opencv":
-            _save_camera_npz(
-                env.sim,
-                camera_name,
-                width,
-                height,
-                out_dir / "camera_params" / "opencv.npz",
-                convert_to_opencv=True,
-            )
-
     for step_idx, action in enumerate(actions):
         if obs is None or depth_key not in obs:
             raise KeyError(f"Depth key '{depth_key}' not found in observation.")
@@ -229,25 +198,12 @@ def _replay_demo(
             raise KeyError(f"RGB key '{rgb_key}' not found in observation.")
 
         depth = obs[depth_key]
-        os.makedirs(out_dir / "frame_depth", exist_ok=True)
-        frame_out_path = out_dir / "frame_depth" / f"{step_idx:04d}.png"
-        _save_depth_png(depth, frame_out_path)
+        out_path = out_dir / f"frame_{step_idx:04d}.png"
+        _save_depth_png(depth, out_path)
         if save_npy:
             os.makedirs(out_dir / "depth_npy", exist_ok=True)
             npy_path = out_dir / "depth_npy" / f"{step_idx:04d}.npy"
             _save_depth_npy(depth, npy_path)
-        if save_depth_viz:
-            os.makedirs(out_dir / "frame_depth_viz", exist_ok=True)
-            viz_path = out_dir / "frame_depth_viz" / f"{step_idx:04d}.png"
-            _save_depth_viz_png(depth, viz_path)
-        if save_rgb:
-            os.makedirs(out_dir / "frame_rgb", exist_ok=True)
-            rgb_path = out_dir / "frame_rgb" / f"{step_idx:04d}.png"
-            _save_rgb_png(obs[rgb_key], rgb_path)
-        if save_camera_params and camera_params_format == "mujoco":
-            r_c2w, t_w = _get_camera_extrinsics(env.sim, depth_key.replace("_depth", ""))
-            extr_path = out_dir / "camera_params" / "extrinsics" / f"{step_idx:04d}.npz"
-            _save_extrinsics_npz(r_c2w, t_w, extr_path)
 
         obs, _, done, _ = env.step(action.tolist())
         if stop_on_done and done:
