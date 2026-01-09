@@ -247,16 +247,9 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
 
 
 def prepare_observation(obs, resize_size):
-    # processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
-    img = get_libero_image(obs) # for 180 degree rotation
-    # img = Image.fromarray(img)
-    # img = processor.image_processor.apply_transform(img)
-    # img = obs["agentview_image"]
-    wrist_img = get_libero_wrist_image(obs)
-    # wrist_img = Image.fromarray(wrist_img)
-    # wrist_img = processor.image_processor.apply_transform(wrist_img)
-    # img_resized = resize_image_for_policy(img, resize_size)
-    # wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
+    # img = get_libero_image(obs) # for 180 degree rotation
+    img = obs["agentview_image"][::-1, ::-1] # 180 degree rotation
+    wrist_img = obs["robot0_eye_in_hand_image"][::-1, ::-1] # 180 degree rotation
     proprio = np.concatenate([obs["robot0_gripper_qpos"], np.hstack([obs["robot0_eef_pos"], T.quat2axisangle(obs["robot0_eef_quat"])])])
     observation = {
         "full_image": img,
@@ -621,9 +614,8 @@ def run_episode(
                 model.device if hasattr(model, "device") else 0
             )
             if all_images:
-                image_wrist = Image.fromarray(image_wrist)
                 all_wrist_inputs = [
-                    processor(prompt, image_wrist, return_tensors="pt").to(
+                    processor(prompt, Image.fromarray(image_wrist), return_tensors="pt").to(
                         model.device if hasattr(model, "device") else 0
                     )
                     for image_wrist in all_images
@@ -631,7 +623,6 @@ def run_episode(
                 primary_pixel_values = inputs["pixel_values"]
                 all_wrist_pixel_values = [wi["pixel_values"] for wi in all_wrist_inputs]
                 inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
-
             proprio = None
             if cfg.use_proprio:
                 proprio = observation["state"]
@@ -832,7 +823,7 @@ def run_task(
                 continue
             initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
-        log_message(f"Starting episode {task_episodes + 1}...", log_file)
+        # log_message(f"Starting episode {task_episodes + 1}...", log_file)
         success, replay_images = run_episode(
             cfg,
             env,

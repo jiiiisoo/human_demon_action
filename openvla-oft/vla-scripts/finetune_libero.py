@@ -52,7 +52,13 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, PointTrackingHead, PointTrackingHeadWithPointInput
+from prismatic.models.action_heads import (
+    DiffusionActionHead,
+    L1RegressionActionHead,
+    PointTrackingHead,
+    PointTrackingHeadParallel,
+    PointTrackingHeadWithPointInput,
+)
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -74,8 +80,9 @@ from prismatic.vla.constants import (
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
 )
-from prismatic.vla.datasets import LIBEROBatchTransform
+from prismatic.vla.datasets import LIBEROBatchTransform, RoboCasaBatchTransform
 from prismatic.vla.datasets.libero_hdf5_dataset import make_libero_hdf5_datasets
+from prismatic.vla.datasets.robocasa_hdf5_dataset import make_robocasa_hdf5_datasets
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 # Sane Defaults
@@ -87,11 +94,19 @@ class FinetuneConfig:
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
+    # Dataset selection
+    dataset_type: str = "libero"                     # Dataset type: "libero" or "robocasa"
+
     # Dataset - LIBERO specific
     libero_data_dir: Path = Path("/scratch2/jisoo6687/libero/libero_goal_no_noops_track")  # Directory containing LIBERO HDF5 files
     libero_task_suite: str = "libero_goal"           # LIBERO task suite name
-    data_root_dir: Path = Path("datasets/rlds")      # [Not used for LIBERO] Directory containing RLDS datasets
-    dataset_name: str = "libero"                     # [Not used for LIBERO] Name of fine-tuning dataset
+
+    # Dataset - RoboCasa specific
+    robocasa_data_dir: Path = Path("/weka/jisookim/dataset/robocasa/datasets/regenerate_single/regenerate_single")  # Directory containing RoboCasa HDF5 files
+    robocasa_task_suite: str = "robocasa"            # RoboCasa task suite name
+
+    data_root_dir: Path = Path("datasets/rlds")      # [Not used for HDF5 datasets] Directory containing RLDS datasets
+    dataset_name: str = "libero"                     # [Not used for HDF5 datasets] Name of fine-tuning dataset
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
     window_stride: int = 1                           # Stride for sampling frames (1 = all frames, >1 = skip frames for less overlap)
@@ -115,6 +130,7 @@ class FinetuneConfig:
     tracking_num_points: int = 1                     # Number of tracked points per timestep
     tracking_hidden_dim: int = 0                     # Hidden dimension for tracking head MLP (0 => use llm_dim)
     tracking_num_blocks: int = 2                     # Number of MLP blocks for tracking head
+    tracking_head_type: str = "mlp"                  # Tracking head type: "mlp", "with_point_input", or "parallel"
     tracking_loss_weight: float = 1.0                # Scaling factor for tracking loss term
     tracking_label_key: Optional[str] = None         # Dot-delimited key into RLDS batch for point tracking labels
     tracking_use_point_features: bool = False        # If True, fuse base pointcloud into tracking head
@@ -215,8 +231,10 @@ def get_run_id(cfg) -> str:
         if "chkpt" in run_id.split("--")[-1]:
             run_id = "--".join(run_id.split("--")[:-1])
     else:
+        # Use appropriate task suite based on dataset type
+        task_suite = cfg.robocasa_task_suite if cfg.dataset_type == "robocasa" else cfg.libero_task_suite
         run_id = (
-            f"{cfg.vla_path.split('/')[-1]}+{cfg.libero_task_suite}"  # Changed from cfg.dataset_name
+            f"{cfg.vla_path.split('/')[-1]}+{task_suite}"
             f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
             f"+lr-{cfg.learning_rate}"
         )
@@ -340,6 +358,7 @@ def run_forward_pass(
     capture_tracking: bool = False,
     tracking_use_point_features: bool = False,
     tracking_use_pointcloud_input: bool = False,
+    tracking_head_type: str = "mlp",
     tracking_num_points: Optional[int] = None,
     tracking_dim: Optional[int] = None,
     train_dataset=None,
@@ -520,9 +539,14 @@ def run_forward_pass(
             if tracking_head is None:
                 raise ValueError("Tracking head is required but not provided.")
             tracking_pointcloud_for_head = None
-            if tracking_use_point_features:
+            if tracking_use_point_features or tracking_head_type in ("with_point_input", "parallel"):
                 if tracking_use_pointcloud_input and pointcloud_input is not None:
                     tracking_pointcloud_for_head = _pad_or_trim_tracking_pc(pointcloud_input)
+            if tracking_head_type in ("with_point_input", "parallel") and tracking_pointcloud_for_head is None:
+                raise ValueError(
+                    "PointTrackingHeadWithPointInput/PointTrackingHeadParallel requires pointcloud input. "
+                    "Set tracking_use_pointcloud_input=True and provide pointcloud_input."
+                )
             predicted_tracking = tracking_head.module.predict_tracking(
                 actions_hidden_states,
                 pointcloud=tracking_pointcloud_for_head,
@@ -537,6 +561,7 @@ def run_forward_pass(
             )
             if capture_tracking:
                 if pointcloud_input is not None and train_dataset is not None:
+                    print('denormalize pointcloud and tracking')
                     # Denormalize for visualization in real 3D space
                     # Remove batch dimension [0] instead of [:1] to match expected shapes
                     pc_norm = pointcloud_input[0].detach().to(torch.float32).cpu().numpy()  # (num_points, 3)
@@ -1135,6 +1160,7 @@ def run_validation(
                 capture_tracking=False,
                 tracking_use_point_features=cfg.tracking_use_point_features,
                 tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+                tracking_head_type=cfg.tracking_head_type,
                 tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
                 tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
                 train_dataset=train_dataset,
@@ -1191,9 +1217,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         if cfg.tracking_use_pointcloud_input:
             # tracking_use_pointcloud_input means passing pointcloud to tracking head
             # This is independent from use_pointcloud_input (which adds pointcloud to VLA input)
-            assert cfg.tracking_use_point_features, (
+            assert cfg.tracking_use_point_features or cfg.tracking_head_type in ("with_point_input", "parallel"), (
                 "tracking_use_pointcloud_input=True requires tracking_use_point_features=True "
-                "(PointTrackingHeadWithPointInput architecture)."
+                "or tracking_head_type=with_point_input/parallel."
             )
     if cfg.save_tracking_viz:
         assert cfg.use_tracking_head, "save_tracking_viz requires use_tracking_head=True."
@@ -1204,7 +1230,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on LIBERO `{cfg.libero_task_suite}`")
+    task_suite = cfg.robocasa_task_suite if cfg.dataset_type == "robocasa" else cfg.libero_task_suite
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on {cfg.dataset_type.upper()} `{task_suite}`")
 
     # Get experiment run ID
     run_id = get_run_id(cfg)
@@ -1475,17 +1502,36 @@ def finetune(cfg: FinetuneConfig) -> None:
         tracking_point_hidden_dim = (
             cfg.tracking_point_hidden_dim if cfg.tracking_point_hidden_dim > 0 else tracking_hidden_dim
         )
-        tracking_head_cls = PointTrackingHeadWithPointInput if cfg.tracking_use_point_features else PointTrackingHead
-        tracking_module_args = {
-            "input_dim": vla.module.llm_dim,
-            "hidden_dim": tracking_hidden_dim,
-            "point_hidden_dim": tracking_point_hidden_dim,
-            "num_points": cfg.tracking_num_points,
-            "tracking_dim": cfg.tracking_dim,
-            "num_blocks": cfg.tracking_num_blocks,
-        }
-        if not cfg.tracking_use_point_features:
-            tracking_module_args.pop("point_hidden_dim")
+        if cfg.tracking_head_type == "parallel":
+            tracking_head_cls = PointTrackingHeadParallel
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+            }
+        elif cfg.tracking_head_type == "with_point_input":
+            tracking_head_cls = PointTrackingHeadWithPointInput
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "point_hidden_dim": tracking_point_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+                "num_blocks": cfg.tracking_num_blocks,
+            }
+        else:
+            tracking_head_cls = PointTrackingHeadWithPointInput if cfg.tracking_use_point_features else PointTrackingHead
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "point_hidden_dim": tracking_point_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+                "num_blocks": cfg.tracking_num_blocks,
+            }
+            if not cfg.tracking_use_point_features:
+                tracking_module_args.pop("point_hidden_dim")
         tracking_head = init_module(
             tracking_head_cls,
             "tracking_head",
@@ -1509,19 +1555,58 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES += 1
 
     # Instantiate optimizer
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    # trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    # if cfg.use_l1_regression or cfg.use_diffusion:
+    #     trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+    # if cfg.use_diffusion:
+    #     trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+    # if cfg.use_proprio:
+    #     trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    # if cfg.use_pointcloud_input:
+    #     trainable_params += [param for param in pointcloud_projector.parameters() if param.requires_grad]
+    # if cfg.use_tracking_head:
+    #     trainable_params += [param for param in tracking_head.parameters() if param.requires_grad]
+    # print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+    # optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    # Parameter groups 분리
+    param_groups = []
+
+    # VLA backbone
+    vla_params = [param for param in vla.parameters() if param.requires_grad]
+    if vla_params:
+        param_groups.append({'params': vla_params, 'lr': cfg.learning_rate})
+
+    # Action head
     if cfg.use_l1_regression or cfg.use_diffusion:
-        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+        action_params = [param for param in action_head.parameters() if param.requires_grad]
+        param_groups.append({'params': action_params, 'lr': cfg.learning_rate})
+
+    # Diffusion projector
     if cfg.use_diffusion:
-        trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+        diffusion_params = [param for param in noisy_action_projector.parameters() if param.requires_grad]
+        param_groups.append({'params': diffusion_params, 'lr': cfg.learning_rate})
+
+    # Proprio projector
     if cfg.use_proprio:
-        trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+        proprio_params = [param for param in proprio_projector.parameters() if param.requires_grad]
+        param_groups.append({'params': proprio_params, 'lr': cfg.learning_rate})
+
+    # Pointcloud projector
     if cfg.use_pointcloud_input:
-        trainable_params += [param for param in pointcloud_projector.parameters() if param.requires_grad]
+        pointcloud_params = [param for param in pointcloud_projector.parameters() if param.requires_grad]
+        param_groups.append({'params': pointcloud_params, 'lr': cfg.learning_rate})
+
+    # Tracking head (낮은 lr!)
     if cfg.use_tracking_head:
-        trainable_params += [param for param in tracking_head.parameters() if param.requires_grad]
-    print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+        tracking_params = [param for param in tracking_head.parameters() if param.requires_grad]
+        # param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate * 0.1})  # 10배 낮게
+        param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate})
+
+    # Total params 출력
+    total_params = sum(p.numel() for group in param_groups for p in group['params'])
+    print(f"# total trainable params: {total_params}")
+
+    optimizer = AdamW(param_groups)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
@@ -1563,53 +1648,92 @@ def finetune(cfg: FinetuneConfig) -> None:
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # =================================================================================
-    # DATASET LOADING - LIBERO HDF5 SPECIFIC (This is the main change from finetune.py)
+    # DATASET LOADING - HDF5 DATASETS (LIBERO or RoboCasa)
     # =================================================================================
-    
-    # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
-    use_wrist_image = cfg.num_images_in_input > 1
 
-    # Create batch transform for LIBERO (adapted for LIBERO HDF5 format)
-    batch_transform = LIBEROBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder,
-        use_wrist_image=use_wrist_image,
-        use_proprio=cfg.use_proprio,
-        use_pointcloud_input=cfg.use_pointcloud_input,
-        use_tracking_head=cfg.use_tracking_head,
-        tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
-    )
-    
-    # Create LIBERO HDF5 datasets (THIS IS THE KEY CHANGE)
-    # Note: All pointcloud and tracking data comes from tracking_tracks_root
-    # - Initial pointcloud = tracks[0]
-    # - Tracking deltas = tracks[t] - tracks[t-1]
-    train_dataset, val_dataset = make_libero_hdf5_datasets(
-        data_dir=cfg.libero_data_dir,
-        task_suite=cfg.libero_task_suite,
-        batch_transform=batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-        use_wrist_image=use_wrist_image,
-        tracking_tracks_root=cfg.tracking_tracks_root,
-        action_chunk_size=NUM_ACTIONS_CHUNK,
-        window_stride=cfg.window_stride,
-        use_val_set=cfg.use_val_set,
-        normalize_pointcloud=cfg.normalize_pointcloud,
-        normalize_tracking=cfg.normalize_tracking,
-        precomputed_statistics_path=cfg.precomputed_statistics_path,
-        filename=cfg.tracking_tracks_filename,
-    )
+    if cfg.dataset_type == "robocasa":
+        # RoboCasa dataset loading
+        # num_images_in_input: 1=left only, 3=left+right+wrist
+        print(f"\n[Dataset] Loading RoboCasa dataset from {cfg.robocasa_data_dir}")
+
+        # Create batch transform for RoboCasa
+        batch_transform = RoboCasaBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            num_images_in_input=cfg.num_images_in_input,
+            use_proprio=cfg.use_proprio,
+            use_pointcloud_input=cfg.use_pointcloud_input,
+            use_tracking_head=cfg.use_tracking_head,
+            tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+        )
+
+        # Create RoboCasa HDF5 datasets
+        train_dataset, val_dataset = make_robocasa_hdf5_datasets(
+            data_dir=cfg.robocasa_data_dir,
+            task_suite=cfg.robocasa_task_suite,
+            batch_transform=batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+            num_images_in_input=cfg.num_images_in_input,
+            tracking_tracks_root=cfg.tracking_tracks_root,
+            action_chunk_size=NUM_ACTIONS_CHUNK,
+            window_stride=cfg.window_stride,
+            use_val_set=cfg.use_val_set,
+            normalize_pointcloud=cfg.normalize_pointcloud,
+            normalize_tracking=cfg.normalize_tracking,
+            precomputed_statistics_path=cfg.precomputed_statistics_path,
+            filename=cfg.tracking_tracks_filename,
+        )
+    else:
+        # LIBERO dataset loading (default)
+        # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
+        use_wrist_image = cfg.num_images_in_input > 1
+        print(f"\n[Dataset] Loading LIBERO dataset from {cfg.libero_data_dir}")
+
+        # Create batch transform for LIBERO (adapted for LIBERO HDF5 format)
+        batch_transform = LIBEROBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            use_wrist_image=use_wrist_image,
+            use_proprio=cfg.use_proprio,
+            use_pointcloud_input=cfg.use_pointcloud_input,
+            use_tracking_head=cfg.use_tracking_head,
+            tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+        )
+
+        # Create LIBERO HDF5 datasets
+        # Note: All pointcloud and tracking data comes from tracking_tracks_root
+        # - Initial pointcloud = tracks[0]
+        # - Tracking deltas = tracks[t] - tracks[t-1]
+        train_dataset, val_dataset = make_libero_hdf5_datasets(
+            data_dir=cfg.libero_data_dir,
+            task_suite=cfg.libero_task_suite,
+            batch_transform=batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+            use_wrist_image=use_wrist_image,
+            tracking_tracks_root=cfg.tracking_tracks_root,
+            action_chunk_size=NUM_ACTIONS_CHUNK,
+            window_stride=cfg.window_stride,
+            use_val_set=cfg.use_val_set,
+            normalize_pointcloud=cfg.normalize_pointcloud,
+            normalize_tracking=cfg.normalize_tracking,
+            precomputed_statistics_path=cfg.precomputed_statistics_path,
+            filename=cfg.tracking_tracks_filename,
+        )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
     # =================================================================================
-    # END LIBERO-SPECIFIC DATASET LOADING
+    # END HDF5 DATASET LOADING
     # =================================================================================
 
     # Create collator and dataloader
@@ -1722,6 +1846,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 capture_tracking=capture_tracking,
                 tracking_use_point_features=cfg.tracking_use_point_features,
                 tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+                tracking_head_type=cfg.tracking_head_type,
                 tracking_num_points=cfg.tracking_num_points if cfg.use_tracking_head else None,
                 tracking_dim=cfg.tracking_dim if cfg.use_tracking_head else None,
                 train_dataset=train_dataset,
