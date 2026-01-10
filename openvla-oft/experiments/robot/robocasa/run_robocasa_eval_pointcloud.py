@@ -1,8 +1,7 @@
 """
-run_libero_eval_pointcloud.py
+run_robocasa_eval.py
 
-Same as run_libero_eval.py, but adds pointcloud input support by sampling a pointcloud
-from the LIBERO environment at each step and passing it through a PointcloudProjector.
+Evaluate a trained policy on RoboCasa tasks.
 """
 
 import json
@@ -11,49 +10,30 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 import glob
-from transformers import AutoProcessor
 
 import draccus
-try:
-    import imageio.v2 as imageio
-    import matplotlib
+import imageio.v2 as imageio
+import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except Exception:
-    imageio = None
-    plt = None
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
 import tqdm
-from libero.libero import benchmark
 from PIL import Image
-
-import wandb
 import torch
 import robosuite.utils.transform_utils as T
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
-from experiments.robot.libero.libero_utils import (
-    get_libero_dummy_action,
-    get_libero_env,
-    get_libero_image,
-    get_libero_wrist_image,
-    quat2axisangle,
-    save_rollout_video,
-)
 from experiments.robot.openvla_utils import (
     get_action_head,
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
-    resize_image_for_policy,
-    prepare_images_for_vla,
 )
 from experiments.robot.robot_utils import (
     DATE,
@@ -69,33 +49,12 @@ from prismatic.models.projectors import PointcloudProjector
 from prismatic.models.action_heads import PointTrackingHead
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK, ACTION_DIM
 
-# Mesh helpers
-sys.path.append("/home/jisookim/LIBERO")
-from export_gt_pointcloud import (  # type: ignore  # noqa: E402
-    collect_world_meshes,
-    get_reference_center,
-    center_and_crop_meshes,
-)
+from robocasa.utils.dataset_registry import SINGLE_STAGE_TASK_DATASETS
+# from robosuite import load_controller_config
+from robosuite.controllers import load_composite_controller_config
+import robosuite
+
 from pathlib import Path
-
-
-# Define task suite constants
-class TaskSuite(str, Enum):
-    LIBERO_SPATIAL = "libero_spatial"
-    LIBERO_OBJECT = "libero_object"
-    LIBERO_GOAL = "libero_goal"
-    LIBERO_10 = "libero_10"
-    LIBERO_90 = "libero_90"
-
-
-# Define max steps for each task suite
-TASK_MAX_STEPS = {
-    TaskSuite.LIBERO_SPATIAL: 220,
-    TaskSuite.LIBERO_OBJECT: 280,
-    TaskSuite.LIBERO_GOAL: 300,
-    TaskSuite.LIBERO_10: 520,
-    TaskSuite.LIBERO_90: 400,
-}
 
 
 logging.basicConfig(
@@ -116,7 +75,7 @@ class GenerateConfig:
     num_diffusion_steps_train: int = 50
     num_diffusion_steps_inference: int = 50
     use_film: bool = False
-    num_images_in_input: int = 2
+    num_images_in_input: int = 3
     use_proprio: bool = True
 
     center_crop: bool = True
@@ -142,12 +101,11 @@ class GenerateConfig:
     precomputed_statistics_path: Optional[Union[str, Path]] = None
 
     # LIBERO env
-    task_suite_name: str = TaskSuite.LIBERO_SPATIAL
-    num_steps_wait: int = 10
+    task_suite_name: str = "robocasa"
     num_trials_per_task: int = 50
     initial_states_path: str = "DEFAULT"
     env_img_res: int = 256
-
+    max_episode_steps: int = 720
     # Utils
     run_id_note: Optional[str] = None
     local_log_dir: str = "./experiments/logs"
@@ -156,7 +114,61 @@ class GenerateConfig:
     wandb_entity: str = "your-wandb-entity"
     wandb_project: str = "your-wandb-project"
     seed: int = 7
+    num_episodes : int = 50
     # fmt: on
+
+def create_eval_env(
+    env_name,
+    # robosuite-related configs
+    robots="PandaMobile",
+    controllers="OSC_POSE",
+    camera_names=[
+        "robot0_agentview_left",
+        "robot0_agentview_right",
+        "robot0_eye_in_hand",
+    ],
+    camera_widths=256,
+    camera_heights=256,
+    seed=None,
+    # robocasa-related configs
+    obj_instance_split="B",
+    generative_textures=None,
+    randomize_cameras=False,
+    layout_and_style_ids=((1, 1), (2, 2), (4, 4), (6, 9), (7, 10)),
+):
+    # controller_configs = load_controller_config(default_controller=controllers)
+    controller_configs = load_composite_controller_config(
+        controller=None,
+        robot=robots if isinstance(robots, str) else robots[0],
+        )
+
+    env_kwargs = dict(
+        env_name=env_name,
+        robots=robots,
+        controller_configs=controller_configs,
+        camera_names=camera_names,
+        camera_widths=camera_widths,
+        camera_heights=camera_heights,
+        has_renderer=False,
+        has_offscreen_renderer=True,
+        ignore_done=True,
+        use_object_obs=True,
+        use_camera_obs=True,
+        camera_depths=False,
+        seed=seed,
+        obj_instance_split=obj_instance_split,
+        generative_textures=generative_textures,
+        randomize_cameras=randomize_cameras,
+        layout_and_style_ids=layout_and_style_ids,
+        translucent_robot=False,
+    )
+
+    env = robosuite.make(**env_kwargs)
+    return env
+
+def get_task_description(env, fallback_name: str) -> str:
+    ep_meta = env.get_ep_meta() if hasattr(env, "get_ep_meta") else {}
+    return ep_meta.get("lang", fallback_name)
 
 
 def validate_config(cfg: GenerateConfig) -> None:
@@ -164,7 +176,6 @@ def validate_config(cfg: GenerateConfig) -> None:
     if "image_aug" in str(cfg.pretrained_checkpoint):
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
-    assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -175,7 +186,6 @@ def initialize_model(cfg: GenerateConfig):
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
-        # check_unnorm_key(cfg, model)
     pointcloud_projector = (
         PointcloudProjector(model.llm_dim, num_points=cfg.pointcloud_num_points, point_dim=cfg.pointcloud_dim)
         if cfg.use_pointcloud_input
@@ -199,27 +209,14 @@ def initialize_model(cfg: GenerateConfig):
 
     return model, action_head, proprio_projector, noisy_action_projector, processor, pointcloud_projector, tracking_head
 
-def check_unnorm_key(cfg: GenerateConfig, model) -> None:
-    """Check that the model contains the action un-normalization key."""
-    # Initialize unnorm_key
-    unnorm_key = cfg.task_suite_name
-
-    # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
-    # with the suffix "_no_noops" in the dataset name)
-    if unnorm_key not in model.norm_stats and f"{unnorm_key}_no_noops" in model.norm_stats:
-        unnorm_key = f"{unnorm_key}_no_noops"
-
-    assert unnorm_key in model.norm_stats, f"Action un-norm key {unnorm_key} not found in VLA `norm_stats`!"
-
-    # Set the unnorm_key in cfg
-    cfg.unnorm_key = unnorm_key
-
-def setup_logging(cfg: GenerateConfig):
-    run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+def setup_logging(cfg: GenerateConfig, env_name: str):
+    safe_env_name = env_name.replace("/", "_")
+    run_id = f"EVAL-{safe_env_name}-{cfg.model_family}-{DATE_TIME}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
-    os.makedirs(cfg.local_log_dir, exist_ok=True)
-    local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
+    env_log_dir = os.path.join(cfg.local_log_dir, safe_env_name)
+    os.makedirs(env_log_dir, exist_ok=True)
+    local_log_filepath = os.path.join(env_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     logger.info(f"Logging to local log file: {local_log_filepath}")
     if cfg.use_wandb:
@@ -232,6 +229,13 @@ def log_message(message: str, log_file=None):
     if log_file:
         log_file.write(message + "\n")
         log_file.flush()
+
+
+def save_rollout_video(frames, video_path):
+    video_writer = imageio.get_writer(video_path, fps=20)
+    for frame in frames:
+        video_writer.append_data(frame)
+    video_writer.close()
 
 
 def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
@@ -247,16 +251,21 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
 
 
 def prepare_observation(obs, resize_size):
-    # img = get_libero_image(obs) # for 180 degree rotation
-    img = obs["agentview_image"][::-1, ::-1] # 180 degree rotation
-    wrist_img = obs["robot0_eye_in_hand_image"][::-1, ::-1] # 180 degree rotation
+    # processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
+    left_img = obs["robot0_agentview_left_image"][::-1, ::-1]
+    right_img = obs["robot0_agentview_right_image"][::-1, ::-1]
+    wrist_img = obs["robot0_eye_in_hand_image"][::-1, ::-1]
+    # left_img = obs["robot0_agentview_left_image"]
+    # right_img = obs["robot0_agentview_right_image"]
+    # wrist_img = obs["robot0_eye_in_hand_image"]
     proprio = np.concatenate([obs["robot0_gripper_qpos"], np.hstack([obs["robot0_eef_pos"], T.quat2axisangle(obs["robot0_eef_quat"])])])
     observation = {
-        "full_image": img,
+        "left_image": left_img,
+        "right_image": right_img,
         "wrist_image": wrist_img,
         "state": proprio,
     }
-    return observation, img
+    return observation
 
 
 def center_crop_and_resize_np(img: np.ndarray, resize_size: Union[int, tuple], crop_scale: float = 0.9) -> np.ndarray:
@@ -352,6 +361,12 @@ def sample_points_from_meshes(meshes, total_points: int, min_per_mesh: int = 200
 
 
 def pointcloud_from_env(env, cube_half: float, num_points: int, include_table: bool) -> np.ndarray:
+    from export_gt_pointcloud import (  # type: ignore  # noqa: E402
+        collect_world_meshes,
+        get_reference_center,
+        center_and_crop_meshes,
+    )
+
     meshes = collect_world_meshes(env, include_robot=True, include_statics=True, exclude_body_substrings=())
     ref_center = get_reference_center(meshes, keyword="table")
     filtered = [m for m in meshes if include_table or "table" not in m["name"].lower()]
@@ -538,7 +553,7 @@ def denormalize_action(action: np.ndarray, dataset_statistics: dict) -> np.ndarr
 def run_episode(
     cfg: GenerateConfig,
     env,
-    task_description: str,
+    env_name: str,
     model,
     resize_size,
     processor=None,
@@ -552,10 +567,13 @@ def run_episode(
     dataset_statistics=None,
 ):
     env.reset()
-    if initial_state is not None:
-        obs = env.set_init_state(initial_state)
-    else:
-        obs = env.get_observation()
+    obs = env._get_observations(force_update=True)
+    task_description = get_task_description(env, env_name)
+    log_message(f"\nTask: {task_description}", log_file)
+    # if initial_state is not None:
+    #     obs = env.set_init_state(initial_state)
+    # else:
+    #     obs = env.get_observation()
 
     if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
         print(
@@ -568,20 +586,20 @@ def run_episode(
 
     t = 0
     replay_images = []
-    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    max_steps = cfg.max_episode_steps
 
     # initial pointcloud
-    if cfg.point_visualize:
+    if cfg.point_visualize or cfg.use_pointcloud_input:
         pc_np = pointcloud_from_env(
             env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
         )
     
     # Normalize pointcloud if statistics are available and normalization is enabled
-    if cfg.point_visualize and cfg.normalize_pointcloud and dataset_statistics is not None:
+    if (cfg.point_visualize or cfg.use_pointcloud_input) and cfg.normalize_pointcloud :
         pc_np = normalize_pointcloud(pc_np, dataset_statistics)
     
     device = model.device if hasattr(model, "device") else 0
-    if cfg.point_visualize:
+    if cfg.point_visualize or cfg.use_pointcloud_input:
         pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
     pc_debug_dir = None
     if cfg.point_visualize and (cfg.save_pc_debug or cfg.point_visualize):
@@ -591,23 +609,25 @@ def run_episode(
             save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / "pc_init.ply")
 
     success = False
-    while t < max_steps + cfg.num_steps_wait:
-        if t < cfg.num_steps_wait:
-            obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
-            t += 1
-            continue
+    while t < max_steps:
+        frame = env.sim.render(
+            height=cfg.env_img_res,
+            width=cfg.env_img_res,
+            camera_name="robot0_agentview_left",
+        )[::-1, ::-1]
+        replay_images.append(frame)
 
-        observation, img = prepare_observation(obs, resize_size)
-        replay_images.append(img)
+        observation = prepare_observation(obs, resize_size)
 
         if len(action_queue) == 0:
             prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
-            all_images = [observation["full_image"]]
+            all_images = [observation["left_image"]]
             if cfg.num_images_in_input > 1:
+                all_images.append(observation["right_image"])
+            if cfg.num_images_in_input > 2:
                 all_images.append(observation["wrist_image"])
             if cfg.center_crop:
                 all_images = [center_crop_and_resize_np(img, resize_size) for img in all_images]
-            # all_images = prepare_images_for_vla(all_images, cfg)
             primary_image = all_images.pop(0)
             primary_image = Image.fromarray(primary_image)
             inputs = processor(prompt, primary_image, return_tensors="pt").to(
@@ -623,11 +643,10 @@ def run_episode(
                 primary_pixel_values = inputs["pixel_values"]
                 all_wrist_pixel_values = [wi["pixel_values"] for wi in all_wrist_inputs]
                 inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
+
             proprio = None
             if cfg.use_proprio:
                 proprio = observation["state"]
-                # Normalize proprio using dataset statistics (same as training)
-                # if dataset_statistics is not None and "proprio" in dataset_statistics:
                 proprio = normalize_proprio(proprio, dataset_statistics)
                 proprio = torch.tensor(proprio, device=inputs["input_ids"].device).unsqueeze(0)
             if cfg.use_pointcloud_input:
@@ -648,25 +667,10 @@ def run_episode(
                     )
                     
                     # Denormalize actions using dataset statistics (same as training)
-                    if dataset_statistics is not None and "action" in dataset_statistics:
-                        # Convert to numpy, denormalize, convert back
-                        actions_pred_np = actions_pred.cpu().numpy()  # (chunk_size, action_dim)
-                        actions_pred_denorm = denormalize_action(actions_pred_np, dataset_statistics)
-                        actions = [actions_pred_denorm[i] for i in range(len(actions_pred_denorm))]
-                    else:
-                        # Fallback to model's denormalization if statistics not available
-                        logger.warning("Dataset statistics not available, using model's denormalization (may be inconsistent with training)")
-                        if cfg.unnorm_key and cfg.unnorm_key in model.norm_stats:
-                            action_norm_stats = model.norm_stats[cfg.unnorm_key]["action"]
-                            q01, q99 = (
-                                action_norm_stats["q01"],
-                                action_norm_stats["q99"],
-                            )
-                            actions_pred_np = actions_pred.cpu().numpy()
-                            actions_pred_denorm = (actions_pred_np + 1) * (q99 - q01) / 2 + q01
-                            actions = [actions_pred_denorm[i] for i in range(len(actions_pred_denorm))]
-                        else:
-                            actions = [actions_pred[i].cpu().numpy() for i in range(len(actions_pred))]
+                    # Convert to numpy, denormalize, convert back
+                    actions_pred_np = actions_pred.cpu().numpy()  # (chunk_size, action_dim)
+                    actions_pred_denorm = denormalize_action(actions_pred_np, dataset_statistics)
+                    actions = [actions_pred_denorm[i] for i in range(len(actions_pred_denorm))]
 
                     # Optional: visualize tracking head outputs as sequence video
                     if cfg.point_visualize and tracking_head is not None:
@@ -674,7 +678,7 @@ def run_episode(
                         pred_seq = pred_tracking[0].detach().to(torch.float32).cpu().numpy()  # (chunk_len, num_points, dim)
                         
                         # Denormalize tracking deltas if statistics are available
-                        if cfg.normalize_tracking and dataset_statistics is not None:
+                        if cfg.normalize_tracking:
                             pred_seq = denormalize_tracking(pred_seq, dataset_statistics)
                         
                         # Build cumulative sequence: initial, initial+delta1, initial+delta1+delta2, ...
@@ -682,7 +686,7 @@ def run_episode(
                         init_pc_normalized = pc_tensor[0].detach().to(torch.float32).cpu().numpy()
                         
                         # Denormalize initial pointcloud for visualization
-                        if cfg.normalize_pointcloud and dataset_statistics is not None:
+                        if cfg.normalize_pointcloud:
                             # Denormalize using inverse transformation
                             if "pointcloud" in dataset_statistics:
                                 pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
@@ -702,19 +706,6 @@ def run_episode(
                             seq_video_path = pc_debug_dir / f"track_pred_{t:04d}.mp4"
                             save_sequence_video(pred_seq_with_input, seq_video_path)
             else:
-                # get_action() uses model's unnorm_key for denormalization
-                # We need to re-normalize and then denormalize with dataset statistics
-                # actions = get_action(
-                #     cfg,
-                #     model,
-                #     observation,
-                #     task_description,
-                #     processor=processor,
-                #     action_head=action_head,
-                #     proprio_projector=proprio_projector,
-                #     noisy_action_projector=noisy_action_projector,
-                #     use_film=cfg.use_film,
-                # )
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     # Get normalized actions from model (unnorm_key=None to prevent model's denormalization)
                     actions_pred, normalized_actions, actions_hidden_states = model.predict_action(
@@ -730,39 +721,19 @@ def run_episode(
                         use_film=cfg.use_film,
                         action_head=action_head,
                     )
-                # actions_pred_np = normalized_actions.cpu().numpy()
+
                 actions = denormalize_action(normalized_actions, dataset_statistics)
-                
-                # If dataset statistics available, re-normalize and denormalize with correct statistics
-                # if dataset_statistics is not None and "action" in dataset_statistics:
-                #     # get_action() returns denormalized actions using model's norm_stats
-                #     # We need to use dataset_statistics instead
-                #     # First, re-normalize using model's norm_stats
-                #     if cfg.unnorm_key and cfg.unnorm_key in model.norm_stats:
-                #         print(f"Re-normalizing actions using model's norm_stats: {cfg.unnorm_key}")
-                #         action_norm_stats = model.norm_stats[cfg.unnorm_key]["action"]
-                #         q01_model = np.array(action_norm_stats["q01"])
-                #         q99_model = np.array(action_norm_stats["q99"])
-                        
-                #         # Convert actions to numpy if needed
-                #         actions_np = np.array([a.cpu().numpy() if isinstance(a, torch.Tensor) else a for a in actions])
-                        
-                #         # Re-normalize using model's statistics: normalized = 2 * (action - q01) / (q99 - q01) - 1
-                #         actions_normalized = 2.0 * (actions_np - q01_model) / (q99_model - q01_model + 1e-8) - 1.0
-                        
-                #         # Denormalize using dataset statistics
-                #         actions_denorm = denormalize_action(actions_normalized, dataset_statistics)
-                #         actions = [actions_denorm[i] for i in range(len(actions_denorm))]
-                #     else:
-                #         logger.warning("Model norm_stats not available for re-normalization")
             
             actions = actions
             action_queue.extend(actions)
 
         action = action_queue.popleft()
         action = process_action(action, cfg.model_family)
+        if action.shape[-1] == 7:
+            pad = np.array([0.0, 0.0, 0.0, -1.0], dtype=action.dtype)
+            action = np.concatenate([action, pad], axis=-1)
         obs, reward, done, info = env.step(action.tolist())
-        if done:
+        if env._check_success():
             success = True
             break
         t += 1
@@ -775,7 +746,7 @@ def run_episode(
             )
             
             # Normalize pointcloud if statistics are available and normalization is enabled
-            if cfg.normalize_pointcloud and dataset_statistics is not None:
+            if cfg.normalize_pointcloud :
                 pc_np = normalize_pointcloud(pc_np, dataset_statistics)
             
             pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
@@ -786,13 +757,12 @@ def run_episode(
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
 
-    return success, replay_images
+    return success, replay_images, task_description
 
 
 def run_task(
     cfg: GenerateConfig,
-    task_suite,
-    task_id: int,
+    env_name: str,
     model,
     resize_size,
     processor=None,
@@ -804,37 +774,39 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    rollout_dir=None,
     dataset_statistics=None,
 ):
-    task = task_suite.get_task(task_id)
-    initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
-    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+    # task = task_suite.get_task(task_id)
+    # initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
+    # env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
 
+    env = create_eval_env(env_name=env_name, camera_widths=cfg.env_img_res, camera_heights=cfg.env_img_res)
+    # task_description = get_task_description(env, env_name)
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
-        log_message(f"\nTask: {task_description}", log_file)
-        if cfg.initial_states_path == "DEFAULT":
-            initial_state = initial_states[episode_idx]
-        else:
-            initial_states_task_key = task_description.replace(" ", "_")
-            episode_key = f"demo_{episode_idx}"
-            if not all_initial_states[initial_states_task_key][episode_key]["success"]:
-                log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
-                continue
-            initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
+    for episode_idx in tqdm.tqdm(range(cfg.num_episodes)):
+        # if cfg.initial_states_path == "DEFAULT":
+        #     initial_state = initial_states[episode_idx]
+        # else:
+        #     initial_states_task_key = task_description.replace(" ", "_")
+        #     episode_key = f"demo_{episode_idx}"
+        #     if not all_initial_states[initial_states_task_key][episode_key]["success"]:
+        #         log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
+        #         continue
+        #     initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
-        # log_message(f"Starting episode {task_episodes + 1}...", log_file)
-        success, replay_images = run_episode(
+        log_message(f"Starting episode {task_episodes + 1}...", log_file)
+        success, replay_images, task_description = run_episode(
             cfg,
             env,
-            task_description,
+            env_name,
             model,
             resize_size,
             processor,
             action_head,
             proprio_projector,
             noisy_action_projector,
-            initial_state,
+            None,
             log_file,
             pointcloud_projector,
             tracking_head,
@@ -845,14 +817,13 @@ def run_task(
         if success:
             task_successes += 1
             total_successes += 1
-        save_rollout_video(
-            rollout_images=replay_images,
-            idx=total_episodes,
-            success=success,
-            task_description=task_description,
-            rollout_dir=os.path.join(cfg.rollout_dir, DATE),
-            log_file=log_file,
+        safe_task = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+        base_dir = rollout_dir or os.path.join(cfg.rollout_dir, DATE)
+        os.makedirs(base_dir, exist_ok=True)
+        video_path = (
+            f"{base_dir}/{DATE_TIME}--openvla_oft--episode={total_episodes}--success={success}--task={safe_task}.mp4"
         )
+        save_rollout_video(replay_images, video_path)
         log_message(f"Success: {success}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
@@ -861,6 +832,7 @@ def run_task(
     total_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
     log_message(f"Current task success rate: {task_success_rate}", log_file)
     log_message(f"Current total success rate: {total_success_rate}", log_file)
+    log_message(f"Final {env_name} success rate: {task_success_rate}", log_file)
     if cfg.use_wandb:
         wandb.log(
             {
@@ -868,15 +840,15 @@ def run_task(
                 f"num_episodes/{task_description}": task_episodes,
             }
         )
-    return total_episodes, total_successes
+    return total_episodes, total_successes, task_success_rate
 
 
 @draccus.wrap()
-def eval_libero(cfg: GenerateConfig) -> float:
+def eval_robocasa(cfg: GenerateConfig) -> float:
     validate_config(cfg)
-    set_seed_everywhere(cfg.seed)
     
     # Load action_chunk_size from checkpoint if available
+    ## Initializing mdoel
     global NUM_ACTIONS_CHUNK
     if cfg.pretrained_checkpoint and os.path.isdir(cfg.pretrained_checkpoint):
         args_config_path = Path(cfg.pretrained_checkpoint) / "args_config.json"
@@ -1011,18 +983,16 @@ def eval_libero(cfg: GenerateConfig) -> float:
         tracking_head,
     ) = initialize_model(cfg)
     resize_size = get_image_resize_size(cfg)
-    log_file, local_log_filepath, run_id = setup_logging(cfg)
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks = task_suite.n_tasks
-    log_message(f"Task suite: {cfg.task_suite_name}", log_file)
-
+    # Initializing envs
+    env_names = sorted([name for name in SINGLE_STAGE_TASK_DATASETS if name != "NavigateKitchen"])[18:]
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
-        total_episodes, total_successes = run_task(
+    per_env_summary = []
+    for e_name in env_names:
+        log_file, local_log_filepath, run_id = setup_logging(cfg, e_name)
+        env_rollout_dir = os.path.join(cfg.rollout_dir, e_name.replace("/", "_"), DATE)
+        total_episodes, total_successes, env_success_rate = run_task(
             cfg,
-            task_suite,
-            task_id,
+            e_name,
             model,
             resize_size,
             processor,
@@ -1034,14 +1004,25 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            env_rollout_dir,
             dataset_statistics,
         )
+        per_env_summary.append((e_name, env_success_rate))
+        if log_file:
+            log_file.close()
 
     final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
-    log_message("Final results:", log_file)
-    log_message(f"Total episodes: {total_episodes}", log_file)
-    log_message(f"Total successes: {total_successes}", log_file)
-    log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
+    summary_path = os.path.join(cfg.local_log_dir, "overall_summary.txt")
+    with open(summary_path, "w") as summary_file:
+        summary_file.write("Final results:\n")
+        summary_file.write("Per-env success rates:\n")
+        for env_name, env_success_rate in per_env_summary:
+            summary_file.write(f"- {env_name}: {env_success_rate:.4f}\n")
+        summary_file.write(f"Total episodes: {total_episodes}\n")
+        summary_file.write(f"Total successes: {total_successes}\n")
+        summary_file.write(
+            f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)\n"
+        )
 
     if cfg.use_wandb:
         wandb.log(
@@ -1050,11 +1031,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
                 "num_episodes/total": total_episodes,
             }
         )
-        wandb.save(local_log_filepath)
-    if log_file:
-        log_file.close()
+        wandb.save(summary_path)
     return final_success_rate
 
 
 if __name__ == "__main__":
-    eval_libero()
+    eval_robocasa()

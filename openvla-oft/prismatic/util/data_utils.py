@@ -124,11 +124,19 @@ class PaddedCollatorForActionPrediction:
 
         # Stack all `pixel_values` --> depending on type is torch.Tensor or Dict[str, torch.Tensor]
         if isinstance(pixel_values[0], torch.Tensor):
+            pixel_values_stacked = torch.stack(pixel_values)
+
+            # Add secondary image if present (for multi-camera setups like RoboCasa)
+            if "pixel_values_secondary" in instances[0]:
+                pixel_values_secondary = [instance["pixel_values_secondary"] for instance in instances]
+                pixel_values_stacked = torch.cat((pixel_values_stacked, torch.stack(pixel_values_secondary)), dim=1)
+
+            # Add wrist image if present
             if "pixel_values_wrist" in instances[0]:
                 pixel_values_wrist = [instance["pixel_values_wrist"] for instance in instances]
-                pixel_values = torch.cat((torch.stack(pixel_values), torch.stack(pixel_values_wrist)), dim=1)
-            else:
-                pixel_values = torch.stack(pixel_values)
+                pixel_values_stacked = torch.cat((pixel_values_stacked, torch.stack(pixel_values_wrist)), dim=1)
+
+            pixel_values = pixel_values_stacked
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
