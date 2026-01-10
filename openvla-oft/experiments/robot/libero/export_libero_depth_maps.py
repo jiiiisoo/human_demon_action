@@ -229,8 +229,9 @@ def _replay_demo(
             raise KeyError(f"RGB key '{rgb_key}' not found in observation.")
 
         depth = obs[depth_key]
-        os.makedirs(out_dir / "frame_depth", exist_ok=True)
-        frame_out_path = out_dir / "frame_depth" / f"{step_idx:04d}.png"
+        # os.makedirs(out_dir / "frame_depth", exist_ok=True)
+        # frame_out_path = out_dir / "frame_depth" / f"{step_idx:04d}.png"
+        frame_out_path = out_dir / f"{step_idx:04d}.png"
         _save_depth_png(depth, frame_out_path)
         if save_npy:
             os.makedirs(out_dir / "depth_npy", exist_ok=True)
