@@ -479,6 +479,7 @@ def _build_tracking_points_from_faces(
     table_weight: float = 1.0,
     robot_weight: float = 6.0,
     gripper_weight: float = 20.0,
+    always_include_robot: bool = True,
 ) -> np.ndarray:
     """
     Sample points from mesh faces with weighted sampling (same as generate_tracking_data.py).
@@ -487,12 +488,17 @@ def _build_tracking_points_from_faces(
     - Robot meshes: 6x weight
     - Gripper meshes: 20x weight
     - Table meshes: 1x weight
+    
+    Args:
+        always_include_robot: If True, robot/gripper meshes are always included 
+                            regardless of cube bounds (prevents clipping during evaluation)
     """
     sim = env.sim
     model = sim.model
     
     face_tris: List[np.ndarray] = []
     face_areas: List[float] = []
+    face_is_robot: List[bool] = []  # Track which faces are from robot/gripper
     
     cube_center = np.asarray(cube_center, dtype=np.float32)
     bounds_min = np.asarray(bounds_min, dtype=np.float32)
@@ -505,7 +511,10 @@ def _build_tracking_points_from_faces(
         body_name = model.body_id2name(body_id) or f"body_{body_id}"
         lname = body_name.lower()
         
-        # Skip based on include flags
+        # Check if this is a robot/gripper mesh
+        is_robot_or_gripper = lname.startswith("robot0") or lname.startswith("gripper0")
+        
+        # Skip based on include flags (but never skip robot/gripper if always_include_robot)
         if not include_table and "table" in lname:
             continue
         if not include_wall and ("world" in lname or "mount0" in lname or lname.startswith("wall")):
@@ -539,13 +548,19 @@ def _build_tracking_points_from_faces(
         R = sim.data.geom_xmat[geom_id].reshape(3, 3)
         t = sim.data.geom_xpos[geom_id]
         world_verts = local_verts @ R.T + t
+        pose_triangles = world_verts[faces]
         
         # Filter faces that overlap with cube
-        pose_triangles = world_verts[faces]
-        tri_min = pose_triangles.min(axis=1)
-        tri_max = pose_triangles.max(axis=1)
-        overlap = np.all(tri_min <= cube_max, axis=1) & np.all(tri_max >= cube_min, axis=1)
-        valid_tris = pose_triangles[overlap]
+        # Skip cube filtering for robot/gripper if always_include_robot is True
+        if always_include_robot and is_robot_or_gripper:
+            # Include ALL robot/gripper triangles regardless of cube bounds
+            valid_tris = pose_triangles
+        else:
+            # Apply cube filtering for other objects
+            tri_min = pose_triangles.min(axis=1)
+            tri_max = pose_triangles.max(axis=1)
+            overlap = np.all(tri_min <= cube_max, axis=1) & np.all(tri_max >= cube_min, axis=1)
+            valid_tris = pose_triangles[overlap]
         
         if len(valid_tris) == 0:
             continue
@@ -563,6 +578,8 @@ def _build_tracking_points_from_faces(
         
         face_tris.extend(list(valid_tris))
         face_areas.extend(list(areas))
+        # Mark which faces are from robot/gripper for cube-free sampling
+        face_is_robot.extend([is_robot_or_gripper] * len(valid_tris))
     
     if not face_tris:
         return np.zeros((0, 3), dtype=np.float32)
@@ -579,11 +596,16 @@ def _build_tracking_points_from_faces(
         attempts += 1
         idx = int(np.random.choice(len(face_tris), p=probs))
         tri_world = face_tris[idx]
+        is_robot_face = face_is_robot[idx]
         barycentric = np.random.dirichlet(alpha=np.ones(3)).astype(np.float32)
         point = barycentric[0] * tri_world[0] + barycentric[1] * tri_world[1] + barycentric[2] * tri_world[2]
         
-        # Check if point is inside cube
-        if np.all(point >= cube_min) and np.all(point <= cube_max):
+        # Check if point is inside cube (skip check for robot/gripper if always_include_robot)
+        if is_robot_face and always_include_robot:
+            # Robot/gripper points are always included
+            points.append(point)
+        elif np.all(point >= cube_min) and np.all(point <= cube_max):
+            # Other points must be inside cube
             points.append(point)
     
     return np.array(points, dtype=np.float32) if points else np.zeros((0, 3), dtype=np.float32)
@@ -744,6 +766,7 @@ def pointcloud_from_env(
         table_weight=1.0,     # Default from generate_tracking_data.py
         robot_weight=6.0,     # Default from generate_tracking_data.py
         gripper_weight=20.0,  # Default from generate_tracking_data.py
+        always_include_robot=True,  # Always include robot/gripper regardless of cube bounds
     )
     
     if pts.size == 0:
