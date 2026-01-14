@@ -732,7 +732,7 @@ def pointcloud_from_env(
         recenter_origin = adjusted_center.copy()
     
     # Use weighted sampling (same as generate_tracking_data.py)
-    # This applies robot_weight=6.0, gripper_weight=20.0 automatically
+    # This returns points in WORLD COORDINATES
     pts = _build_tracking_points_from_faces(
         env=env,
         cube_center=adjusted_center,
@@ -747,18 +747,21 @@ def pointcloud_from_env(
     )
     
     if pts.size == 0:
-        pts = np.zeros((num_points, 3), dtype=np.float32)
-        if recenter_points and recenter_origin is not None:
-            pts = pts - recenter_origin
-        return pts, recenter_origin, direction_vec
+        return np.zeros((num_points, 3), dtype=np.float32), recenter_origin, direction_vec
     
-    # Apply transformations
-    if recenter_points and recenter_origin is not None:
-        pts = pts - (adjusted_center - recenter_origin)
+    # Apply transformations (same as generate_tracking_data.py)
+    if recenter_points:
+        # Recenter: subtract the first frame's adjusted_center (recenter_origin)
+        # This makes the first frame's adjusted_center the origin
+        pts = pts - recenter_origin
         
-    if align_forward_to_neg_x and direction_vec is not None and recenter_points:
-        # Rotate around origin (after recentering)
-        pts = _align_points_to_neg_x(pts, direction_vec, center=np.zeros(3, dtype=np.float32))
+        # Align: rotate around the new origin (zeros)
+        if align_forward_to_neg_x and direction_vec is not None:
+            pts = _align_points_to_neg_x(pts, direction_vec, center=np.zeros(3, dtype=np.float32))
+    else:
+        # If not recentering, align around current adjusted_center
+        if align_forward_to_neg_x and direction_vec is not None:
+            pts = _align_points_to_neg_x(pts, direction_vec, center=adjusted_center)
     
     return pts, recenter_origin, direction_vec
 
