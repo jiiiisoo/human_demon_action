@@ -227,6 +227,7 @@ class RoboCasaHdf5Dataset(Dataset):
         normalize_tracking: bool = True,
         precomputed_statistics_path: Optional[Path] = None,
         filename: str = "vertex_tracks_face_uniform.npy",
+        use_last_pointcloud_target: bool = False,  # If True, returns final pointcloud instead of tracking deltas
     ) -> None:
         """
         Args:
@@ -246,6 +247,7 @@ class RoboCasaHdf5Dataset(Dataset):
             normalize_pointcloud: If True, normalize pointcloud input using dataset statistics (x, y, z separately)
             normalize_tracking: If True, normalize tracking data using dataset statistics (x, y, z separately)
             precomputed_statistics_path: Path to precomputed statistics JSON file (if None, compute on-the-fly)
+            use_last_pointcloud_target: If True, returns final pointcloud as target instead of tracking deltas
         """
         self.data_dir = Path(data_dir)
         self.task_suite = task_suite
@@ -263,6 +265,7 @@ class RoboCasaHdf5Dataset(Dataset):
         self.should_normalize_tracking = normalize_tracking
         self.precomputed_statistics_path = Path(precomputed_statistics_path) if precomputed_statistics_path else None
         self.filename = filename
+        self.use_last_pointcloud_target = use_last_pointcloud_target
 
         # Find all HDF5 files in the directory (recursive search for RoboCasa structure)
         # Pattern: data_dir/*/*/*/*.hdf5 (e.g., kitchen_coffee/CoffeePressButton/2024-04-25/*.hdf5)
@@ -866,21 +869,29 @@ class RoboCasaHdf5Dataset(Dataset):
                     pointcloud = tracks[frame_idx]  # (num_points, 3)
 
                 if load_tracking:
-                    # Tracking deltas for action chunk
-                    # If actions are frame_idx to frame_idx+chunk_size-1,
-                    # tracking deltas are tracks[frame_idx+1] - tracks[frame_idx],
-                    #                    tracks[frame_idx+2] - tracks[frame_idx+1], ...
-                    tracking_deltas = []
-                    for offset in range(self.action_chunk_size):
-                        t_curr = frame_idx + offset
-                        t_next = t_curr + 1
+                    if self.use_last_pointcloud_target:
+                        # Return final pointcloud instead of tracking deltas
+                        # Final pointcloud is at frame_idx + action_chunk_size
+                        final_frame_idx = frame_idx + self.action_chunk_size
+                        final_pointcloud = tracks[final_frame_idx]  # (num_points, 3)
+                        # Add time dimension to match tracking head interface: (N, 3) -> (1, N, 3)
+                        tracking_deltas = final_pointcloud[np.newaxis, :, :]  # (1, num_points, 3)
+                    else:
+                        # Tracking deltas for action chunk
+                        # If actions are frame_idx to frame_idx+chunk_size-1,
+                        # tracking deltas are tracks[frame_idx+1] - tracks[frame_idx],
+                        #                    tracks[frame_idx+2] - tracks[frame_idx+1], ...
+                        tracking_deltas = []
+                        for offset in range(self.action_chunk_size):
+                            t_curr = frame_idx + offset
+                            t_next = t_curr + 1
 
-                        # Both t_curr and t_next are guaranteed to be in bounds
-                        # because frame_idx + action_chunk_size <= num_frames < len(tracks)
-                        delta = tracks[t_next] - tracks[t_curr]  # (num_points, 3)
-                        tracking_deltas.append(delta)
+                            # Both t_curr and t_next are guaranteed to be in bounds
+                            # because frame_idx + action_chunk_size <= num_frames < len(tracks)
+                            delta = tracks[t_next] - tracks[t_curr]  # (num_points, 3)
+                            tracking_deltas.append(delta)
 
-                    tracking_deltas = np.stack(tracking_deltas, axis=0)  # (action_chunk_size, num_points, 3)
+                        tracking_deltas = np.stack(tracking_deltas, axis=0)  # (action_chunk_size, num_points, 3)
 
         # Build task dict
         task = {
@@ -941,7 +952,13 @@ class RoboCasaHdf5Dataset(Dataset):
             
             tracking = frame_data["tracking"]
             if tracking is not None:
-                frame_data["tracking"] = self.normalize_tracking(tracking)
+                if self.use_last_pointcloud_target:
+                    # For last pointcloud target, use pointcloud statistics (not tracking delta statistics)
+                    # tracking shape: (1, num_points, 3) - final pointcloud position
+                    frame_data["tracking"] = self.normalize_pointcloud(tracking.reshape(-1, 3)).reshape(tracking.shape)
+                else:
+                    # For tracking deltas, use tracking statistics
+                    frame_data["tracking"] = self.normalize_tracking(tracking)
         
         # Apply batch transform (converts to tensors)
         transformed = self.batch_transform(frame_data)
@@ -974,6 +991,7 @@ def make_robocasa_hdf5_datasets(
     normalize_tracking: bool = True,
     precomputed_statistics_path: Optional[Path] = None,
     filename: str = "vertex_tracks_face_uniform.npy",
+    use_last_pointcloud_target: bool = False,
 ) -> Tuple[RoboCasaHdf5Dataset, Optional[RoboCasaHdf5Dataset]]:
     """
     Create train and (optionally) validation datasets from RoboCasa HDF5 files.
@@ -994,6 +1012,7 @@ def make_robocasa_hdf5_datasets(
         normalize_pointcloud: Whether to normalize pointcloud input (x, y, z separately)
         normalize_tracking: Whether to normalize tracking data (x, y, z separately)
         precomputed_statistics_path: Path to precomputed statistics JSON (recommended for large datasets)
+        use_last_pointcloud_target: If True, returns final pointcloud as target instead of tracking deltas
 
     Returns:
         (train_dataset, val_dataset) where val_dataset is None if use_val_set=False
@@ -1015,6 +1034,7 @@ def make_robocasa_hdf5_datasets(
         normalize_tracking=normalize_tracking,
         precomputed_statistics_path=precomputed_statistics_path,
         filename=filename,
+        use_last_pointcloud_target=use_last_pointcloud_target,
     )
 
     val_dataset = None
@@ -1036,6 +1056,7 @@ def make_robocasa_hdf5_datasets(
             normalize_tracking=normalize_tracking,
             precomputed_statistics_path=precomputed_statistics_path,
             filename=filename,
+            use_last_pointcloud_target=use_last_pointcloud_target,
         )
 
     return train_dataset, val_dataset

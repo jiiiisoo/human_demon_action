@@ -1,8 +1,14 @@
 """
-finetune_libero.py
+finetune_last_pointcloud.py
 
-Fine-tunes OpenVLA via LoRA using LIBERO HDF5 datasets.
-This is identical to finetune.py except for the dataset loading section.
+Fine-tunes OpenVLA with Last Pointcloud Head (ablation study).
+Instead of predicting tracking sequences, predicts only the final pointcloud position.
+
+Key differences from finetune_libero.py:
+- Uses LastPointcloudHead instead of PointTrackingHead
+- Fuses action embeddings across time dimension (T -> 1)
+- Predicts single final pointcloud instead of tracking sequence
+- Uses pointcloud statistics for normalization (not tracking statistics)
 """
 
 import json
@@ -55,6 +61,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import (
     DiffusionActionHead,
     L1RegressionActionHead,
+    LastPointcloudHead,
     PointTrackingHead,
     PointTrackingHeadParallel,
     PointTrackingHeadWithPointInput,
@@ -130,7 +137,7 @@ class FinetuneConfig:
     tracking_num_points: int = 1                     # Number of tracked points per timestep
     tracking_hidden_dim: int = 0                     # Hidden dimension for tracking head MLP (0 => use llm_dim)
     tracking_num_blocks: int = 2                     # Number of MLP blocks for tracking head
-    tracking_head_type: str = "mlp"                  # Tracking head type: "mlp", "with_point_input", or "parallel"
+    tracking_head_type: str = "mlp"                  # Tracking head type: "mlp", "with_point_input", "parallel", or "last_pointcloud"
     tracking_loss_weight: float = 1.0                # Scaling factor for tracking loss term
     tracking_label_key: Optional[str] = None         # Dot-delimited key into RLDS batch for point tracking labels
     tracking_use_point_features: bool = False        # If True, fuse base pointcloud into tracking head
@@ -539,12 +546,12 @@ def run_forward_pass(
             if tracking_head is None:
                 raise ValueError("Tracking head is required but not provided.")
             tracking_pointcloud_for_head = None
-            if tracking_use_point_features or tracking_head_type in ("with_point_input", "parallel"):
+            if tracking_use_point_features or tracking_head_type in ("with_point_input", "parallel", "last_pointcloud"):
                 if tracking_use_pointcloud_input and pointcloud_input is not None:
                     tracking_pointcloud_for_head = _pad_or_trim_tracking_pc(pointcloud_input)
-            if tracking_head_type in ("with_point_input", "parallel") and tracking_pointcloud_for_head is None:
+            if tracking_head_type in ("with_point_input", "parallel", "last_pointcloud") and tracking_pointcloud_for_head is None:
                 raise ValueError(
-                    "PointTrackingHeadWithPointInput/PointTrackingHeadParallel requires pointcloud input. "
+                    "PointTrackingHeadWithPointInput/PointTrackingHeadParallel/LastPointcloudHead requires pointcloud input. "
                     "Set tracking_use_pointcloud_input=True and provide pointcloud_input."
                 )
             predicted_tracking = tracking_head.module.predict_tracking(
@@ -565,13 +572,22 @@ def run_forward_pass(
                     # Denormalize for visualization in real 3D space
                     # Remove batch dimension [0] instead of [:1] to match expected shapes
                     pc_norm = pointcloud_input[0].detach().to(torch.float32).cpu().numpy()  # (num_points, 3)
-                    tracking_labels_norm = tracking_labels[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3)
-                    predicted_tracking_norm = predicted_tracking[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3)
-                    # denormalize_pointcloud expects (num_points, 3)
-                    # denormalize_tracking expects (T, num_points, 3)
-                    pc_denorm = train_dataset.denormalize_pointcloud(pc_norm)
-                    tracking_labels_denorm = train_dataset.denormalize_tracking(tracking_labels_norm)
-                    predicted_tracking_denorm = train_dataset.denormalize_tracking(predicted_tracking_norm)
+                    tracking_labels_norm = tracking_labels[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3) or (1, num_points, 3)
+                    predicted_tracking_norm = predicted_tracking[0].detach().to(torch.float32).cpu().numpy()  # (T, num_points, 3) or (1, num_points, 3)
+                    
+                    # Denormalize initial pointcloud
+                    pc_denorm = train_dataset.denormalize_pointcloud(pc_norm)  # (num_points, 3)
+                    
+                    # Denormalize tracking/final pointcloud based on head type
+                    if tracking_head_type == "last_pointcloud":
+                        # Last pointcloud mode: targets are absolute positions, use pointcloud denormalization
+                        # tracking_labels_norm and predicted_tracking_norm have shape (1, num_points, 3)
+                        tracking_labels_denorm = train_dataset.denormalize_pointcloud(tracking_labels_norm.reshape(-1, 3)).reshape(tracking_labels_norm.shape)
+                        predicted_tracking_denorm = train_dataset.denormalize_pointcloud(predicted_tracking_norm.reshape(-1, 3)).reshape(predicted_tracking_norm.shape)
+                    else:
+                        # Tracking sequence mode: targets are deltas, use tracking denormalization
+                        tracking_labels_denorm = train_dataset.denormalize_tracking(tracking_labels_norm)
+                        predicted_tracking_denorm = train_dataset.denormalize_tracking(predicted_tracking_norm)
                     
                     # Add batch dimension back for tracking_debug_data
                     tracking_debug_data = {
@@ -591,19 +607,6 @@ def run_forward_pass(
                 metrics["next_tracking_l1_loss"] = next_tracking_l1.item()
         elif use_tracking_head:
             raise ValueError("Tracking targets missing from batch while tracking head is enabled.")
-        
-        # Capture pointcloud input for visualization (even without tracking head)
-        if capture_tracking and use_pointcloud_input and not use_tracking_head:
-            if pointcloud_input is not None and train_dataset is not None:
-                print('denormalize input pointcloud for visualization')
-                # Denormalize input pointcloud for sanity check visualization
-                pc_norm = pointcloud_input[0].detach().to(torch.float32).cpu().numpy()  # (num_points, 3)
-                pc_denorm = train_dataset.denormalize_pointcloud(pc_norm)
-                
-                # Store only pointcloud input (no tracking predictions)
-                tracking_debug_data = {
-                    "pointcloud_input": torch.from_numpy(pc_denorm).unsqueeze(0),
-                }
 
         if loss is None:
             raise RuntimeError("No loss components were produced; check head configuration.")
@@ -873,76 +876,92 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
                 pass
 
 
-def _save_input_pointcloud_image(
-    pointcloud: np.ndarray,
+def _save_pointcloud_comparison_image(
+    initial_pc: np.ndarray,
+    final_pc_pred: np.ndarray,
+    final_pc_gt: np.ndarray,
     image_path: Path,
     max_points: Optional[int] = None,
 ) -> None:
     """
-    Save single pointcloud visualization (for sanity check of VLA input).
+    Save side-by-side comparison of initial and final pointclouds.
     
     Args:
-        pointcloud: Input pointcloud (N, 3)
+        initial_pc: Initial pointcloud (N, 3)
+        final_pc_pred: Predicted final pointcloud (N, 3)
+        final_pc_gt: Ground truth final pointcloud (N, 3)
         image_path: Path to save the image
         max_points: Maximum points to render
     """
     if not _ensure_tracking_viz_deps():
         return
     
-    if pointcloud.size == 0:
+    if initial_pc.size == 0:
         return
     
     image_path = Path(image_path)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Downsample if needed
-    if max_points and pointcloud.shape[0] > max_points:
-        indices = np.linspace(0, pointcloud.shape[0] - 1, max_points, dtype=int)
-        pointcloud = pointcloud[indices]
+    if max_points and initial_pc.shape[0] > max_points:
+        indices = np.linspace(0, initial_pc.shape[0] - 1, max_points, dtype=int)
+        initial_pc = initial_pc[indices]
+        final_pc_pred = final_pc_pred[indices]
+        final_pc_gt = final_pc_gt[indices]
     
     fig = None
     try:
         import time
         start_time = time.time()
         
-        # Create figure
-        fig = plt.figure(figsize=(6.4, 4.8), dpi=80)
-        ax = fig.add_subplot(111, projection="3d")
-        ax.set_title('Input Pointcloud (VLA Input)', fontsize=12, pad=10)
-        ax.set_axis_off()
+        # Create figure with 3 subplots (initial, predicted, ground truth)
+        fig = plt.figure(figsize=(14.4, 4.8), dpi=80)  # 3 plots side by side
         
-        # Center pointcloud
-        center = pointcloud.mean(axis=0, keepdims=True)
-        pc_centered = pointcloud - center
-        max_range = np.linalg.norm(pc_centered, axis=1).max() + 1e-6
+        # Compute centering and ranges based on all pointclouds
+        all_points = np.concatenate([initial_pc, final_pc_pred, final_pc_gt], axis=0)
+        center = all_points.mean(axis=0, keepdims=True)
+        centered_points = all_points - center
+        max_range = np.linalg.norm(centered_points, axis=1).max() + 1e-6
         max_range *= 1.2  # Add margin
         
-        # Set view limits
-        ax.set_xlim3d([-max_range, max_range])
-        ax.set_ylim3d([-max_range, max_range])
-        ax.set_zlim3d([-max_range, max_range])
+        titles = ['Initial Pointcloud (P0)', 'Predicted Final', 'Ground Truth Final']
+        pointclouds = [initial_pc, final_pc_pred, final_pc_gt]
+        colors = ['blue', 'red', 'green']
         
-        # Set view angle
-        ax.view_init(elev=20.0, azim=45.0)
-        
-        # Plot points
-        ax.scatter(
-            pc_centered[:, 0],
-            pc_centered[:, 1],
-            pc_centered[:, 2],
-            c='blue',
-            marker='o',
-            s=3,
-            alpha=0.6
-        )
+        for idx, (pc, title, color) in enumerate(zip(pointclouds, titles, colors)):
+            ax = fig.add_subplot(1, 3, idx + 1, projection="3d")
+            ax.set_title(title, fontsize=10, pad=5)
+            ax.set_axis_off()
+            
+            # Center pointcloud
+            pc_centered = pc - center
+            
+            # Set consistent view limits
+            ax.set_xlim3d([-max_range, max_range])
+            ax.set_ylim3d([-max_range, max_range])
+            ax.set_zlim3d([-max_range, max_range])
+            
+            # Set view angle
+            ax.view_init(elev=20.0, azim=45.0)
+            
+            # Plot points
+            ax.scatter(
+                pc_centered[:, 0],
+                pc_centered[:, 1],
+                pc_centered[:, 2],
+                c=color,
+                marker='o',
+                s=2,
+                alpha=0.6
+            )
         
         plt.tight_layout()
         fig.savefig(image_path, dpi=80, bbox_inches='tight')
         
         elapsed = time.time() - start_time
-        print(f"Successfully saved input pointcloud to {image_path} (took {elapsed:.2f}s)")
+        print(f"Successfully saved pointcloud comparison to {image_path} (took {elapsed:.2f}s)")
     except Exception as e:
-        print(f"WARNING: Failed to save input pointcloud to {image_path}: {e}")
+        print(f"WARNING: Failed to save pointcloud comparison to {image_path}: {e}")
         import traceback
         traceback.print_exc()
     finally:
@@ -959,45 +978,51 @@ def save_tracking_visualizations(
     log_step: int,
     tracking_labels_are_deltas: bool,
     max_points: Optional[int],
-    pointcloud_input_only: bool = False,
+    use_last_pointcloud_mode: bool = False,
 ) -> None:
     """
-    Save tracking visualizations or pointcloud input visualization.
+    Save tracking visualizations with error handling to prevent training interruption.
     
     Args:
         tracking_debug: Dict with predicted_tracking, tracking_labels, pointcloud_input
         output_dir: Directory to save visualizations
         log_step: Current training step
-        tracking_labels_are_deltas: Whether labels are deltas (for tracking mode)
+        tracking_labels_are_deltas: Whether labels are deltas (for tracking) or absolute positions (for last pointcloud)
         max_points: Max points to render
-        pointcloud_input_only: If True, saves only input pointcloud (no tracking)
+        use_last_pointcloud_mode: If True, saves side-by-side images instead of videos
     """
     if not _ensure_tracking_viz_deps():
         return
     
     try:
-        output_dir = Path(output_dir)
+        pred = tracking_debug.get("predicted_tracking")
+        gt = tracking_debug.get("tracking_labels")
         base_pc = tracking_debug.get("pointcloud_input")
+        if pred is None or gt is None:
+            return
         
-        if pointcloud_input_only:
-            # Pointcloud input only mode: Save input pointcloud for sanity check
-            if base_pc is None:
-                return
-            base_np = base_pc[0].to(torch.float32).cpu().numpy()
-            _save_input_pointcloud_image(
+        pred_np = pred[0].to(torch.float32).cpu().numpy()
+        gt_np = gt[0].to(torch.float32).cpu().numpy()
+        base_np = base_pc[0].to(torch.float32).cpu().numpy() if base_pc is not None else None
+        output_dir = Path(output_dir)
+        
+        if use_last_pointcloud_mode:
+            # Last pointcloud mode: Save side-by-side comparison image
+            # pred_np and gt_np have shape (1, N, 3) - squeeze time dimension
+            if pred_np.ndim == 3 and pred_np.shape[0] == 1:
+                pred_np = pred_np[0]  # (N, 3)
+            if gt_np.ndim == 3 and gt_np.shape[0] == 1:
+                gt_np = gt_np[0]  # (N, 3)
+            # All are absolute positions (not deltas)
+            _save_pointcloud_comparison_image(
                 base_np,
-                output_dir / f"input_pointcloud_step_{log_step:06d}.png",
+                pred_np,
+                gt_np,
+                output_dir / f"pointcloud_comparison_step_{log_step:06d}.png",
                 max_points=max_points,
             )
         else:
-            # Tracking mode: Save tracking videos
-            pred = tracking_debug.get("predicted_tracking")
-            gt = tracking_debug.get("tracking_labels")
-            if pred is None or gt is None:
-                return
-            pred_np = pred[0].to(torch.float32).cpu().numpy()
-            gt_np = gt[0].to(torch.float32).cpu().numpy()
-            base_np = base_pc[0].to(torch.float32).cpu().numpy() if base_pc is not None else None
+            # Tracking sequence mode: Save videos
             pred_seq = _build_tracking_sequence(base_np, pred_np, treat_as_delta=tracking_labels_are_deltas)
             gt_seq = _build_tracking_sequence(base_np, gt_np, treat_as_delta=tracking_labels_are_deltas)
             pred_seq = _downsample_sequence_points(pred_seq, max_points)
@@ -1008,7 +1033,7 @@ def save_tracking_visualizations(
         # Clean up matplotlib resources after visualization
         _cleanup_matplotlib_resources()
     except Exception as e:
-        print(f"WARNING: Failed to save visualizations at step {log_step}: {e}")
+        print(f"WARNING: Failed to save tracking visualizations at step {log_step}: {e}")
         import traceback
         traceback.print_exc()
         # Continue training even if visualization fails
@@ -1340,10 +1365,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "or tracking_head_type=with_point_input/parallel."
             )
     if cfg.save_tracking_viz:
-        assert cfg.use_tracking_head or cfg.use_pointcloud_input, (
-            "save_tracking_viz requires use_tracking_head=True or use_pointcloud_input=True."
-        )
-        assert cfg.tracking_viz_freq > 0, "tracking_viz_freq must be > 0 when saving visualizations."
+        assert cfg.use_tracking_head, "save_tracking_viz requires use_tracking_head=True."
+        assert cfg.tracking_viz_freq > 0, "tracking_viz_freq must be > 0 when saving tracking visualizations."
     if cfg.use_pointcloud_input:
         assert cfg.tracking_tracks_root is not None, "tracking_tracks_root is required when using pointcloud input."
         assert cfg.pointcloud_input_dim > 0, "pointcloud_input_dim must be > 0 when using pointcloud input."
@@ -1640,6 +1663,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "tracking_dim": cfg.tracking_dim,
                 "num_blocks": cfg.tracking_num_blocks,
             }
+        elif cfg.tracking_head_type == "last_pointcloud":
+            tracking_head_cls = LastPointcloudHead
+            tracking_module_args = {
+                "input_dim": vla.module.llm_dim,
+                "hidden_dim": tracking_hidden_dim,
+                "point_hidden_dim": tracking_point_hidden_dim,
+                "num_points": cfg.tracking_num_points,
+                "tracking_dim": cfg.tracking_dim,
+                "num_blocks": cfg.tracking_num_blocks,
+            }
         else:
             tracking_head_cls = PointTrackingHeadWithPointInput if cfg.tracking_use_point_features else PointTrackingHead
             tracking_module_args = {
@@ -1790,6 +1823,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
         # Create RoboCasa HDF5 datasets
+        # Use last pointcloud target when tracking_head_type is "last_pointcloud"
+        use_last_pointcloud_target = (cfg.tracking_head_type == "last_pointcloud")
+        
         train_dataset, val_dataset = make_robocasa_hdf5_datasets(
             data_dir=cfg.robocasa_data_dir,
             task_suite=cfg.robocasa_task_suite,
@@ -1806,6 +1842,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalize_tracking=cfg.normalize_tracking,
             precomputed_statistics_path=cfg.precomputed_statistics_path,
             filename=cfg.tracking_tracks_filename,
+            use_last_pointcloud_target=use_last_pointcloud_target,
         )
     else:
         # LIBERO dataset loading (default)
@@ -1927,15 +1964,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             batch = next(dataloader_iter)
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
             log_step = start_step + gradient_step_idx
-            # Capture visualization: tracking head OR pointcloud input only
-            capture_viz = (
-                (cfg.use_tracking_head or cfg.use_pointcloud_input)
+            capture_tracking = (
+                cfg.use_tracking_head
                 and cfg.save_tracking_viz
                 and distributed_state.is_main_process
                 and ((batch_idx + 1) % cfg.grad_accumulation_steps == 0)
                 and (log_step % cfg.tracking_viz_freq == 0)
             )
-            capture_tracking = capture_viz  # For compatibility
             
             # Log progress at visualization steps for debugging
             if log_step % cfg.tracking_viz_freq == 0 and distributed_state.is_main_process:
@@ -1988,10 +2023,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
-            # Save tracking/pointcloud visualizations only on main process to avoid DDP sync issues
-            # Use capture_viz condition which is consistent across all processes
+            # Save tracking visualizations only on main process to avoid DDP sync issues
+            # Use capture_tracking condition which is consistent across all processes
             should_sync_after_viz = (
-                (cfg.use_tracking_head or cfg.use_pointcloud_input)
+                cfg.use_tracking_head
                 and cfg.save_tracking_viz
                 and ((batch_idx + 1) % cfg.grad_accumulation_steps == 0)
                 and (log_step % cfg.tracking_viz_freq == 0)
@@ -2002,16 +2037,18 @@ def finetune(cfg: FinetuneConfig) -> None:
                 viz_dir = cfg.tracking_viz_dir if cfg.tracking_viz_dir is not None else run_dir / "tracking_viz"
                 print(f"[Main Process] Starting visualization save at step {log_step}...")
                 
-                # Determine visualization mode
-                pointcloud_input_only = cfg.use_pointcloud_input and not cfg.use_tracking_head
+                # Determine visualization mode based on tracking head type
+                use_last_pointcloud_mode = (cfg.tracking_head_type == "last_pointcloud")
+                # Last pointcloud mode uses absolute positions (not deltas)
+                tracking_labels_are_deltas = cfg.tracking_tracks_root is not None and not use_last_pointcloud_mode
                 
                 save_tracking_visualizations(
                     tracking_debug,
                     viz_dir,
                     log_step,
-                    tracking_labels_are_deltas=cfg.tracking_tracks_root is not None,
+                    tracking_labels_are_deltas=tracking_labels_are_deltas,
                     max_points=cfg.tracking_viz_max_points,
-                    pointcloud_input_only=pointcloud_input_only,
+                    use_last_pointcloud_mode=use_last_pointcloud_mode,
                 )
                 print(f"[Main Process] Completed visualization save at step {log_step}")
             

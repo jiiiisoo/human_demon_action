@@ -11,7 +11,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 import glob
 
 import draccus
@@ -99,6 +99,12 @@ class GenerateConfig:
     normalize_pointcloud: bool = True
     normalize_tracking: bool = True
     precomputed_statistics_path: Optional[Union[str, Path]] = None
+    
+    # Pointcloud visualization
+    visualize_pc_image: bool = False
+    save_pc_ply: bool = False
+    pc_viz_freq: int = 1
+    pc_viz_max_points: int = 2000
 
     # LIBERO env
     task_suite_name: str = "robocasa"
@@ -268,6 +274,28 @@ def prepare_observation(obs, resize_size):
     return observation
 
 
+def _align_points_to_neg_x(
+    points: np.ndarray, direction_vec: np.ndarray, *, center: np.ndarray
+) -> np.ndarray:
+    """
+    Rotate points so that direction_vec aligns with -x axis.
+    Same implementation as generate_tracking_data.py.
+    """
+    dx = float(direction_vec[0])
+    dy = float(direction_vec[1])
+    if abs(dx) >= abs(dy):
+        if dx > 0:
+            rot = np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        else:
+            rot = np.eye(3, dtype=np.float32)
+    else:
+        if dy > 0:
+            rot = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        else:
+            rot = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    return (points - center) @ rot.T + center
+
+
 def center_crop_and_resize_np(img: np.ndarray, resize_size: Union[int, tuple], crop_scale: float = 0.9) -> np.ndarray:
     """
     Center-crop and resize an image to match training-time distribution.
@@ -360,22 +388,137 @@ def sample_points_from_meshes(meshes, total_points: int, min_per_mesh: int = 200
     return np.concatenate(pts, axis=0).astype(np.float32) if pts else np.zeros((0, 3), dtype=np.float32)
 
 
-def pointcloud_from_env(env, cube_half: float, num_points: int, include_table: bool) -> np.ndarray:
+def pointcloud_from_env(
+    env,
+    cube_half: float,
+    num_points: int,
+    include_table: bool,
+    recenter_origin: Optional[np.ndarray] = None,
+    direction_vec: Optional[np.ndarray] = None,
+    recenter_points: bool = True,
+    align_forward_to_neg_x: bool = True,
+    direction_offset: float = 0.5,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Extract pointcloud from environment matching the training data generation process.
+    
+    Args:
+        env: RoboCasa environment
+        cube_half: Half-size of the cube for cropping
+        num_points: Number of points to sample
+        include_table: Whether to include table meshes
+        recenter_origin: Origin for recentering (if None, will be computed on first call)
+        direction_vec: Direction vector for alignment (if None, will be computed)
+        recenter_points: Whether to recenter points to origin
+        align_forward_to_neg_x: Whether to align forward direction to -x
+        direction_offset: Offset along direction vector for center adjustment
+    
+    Returns:
+        Tuple of (points, recenter_origin, direction_vec)
+    """
     from export_gt_pointcloud import (  # type: ignore  # noqa: E402
         collect_world_meshes,
         get_reference_center,
-        center_and_crop_meshes,
     )
 
+    # Collect meshes
     meshes = collect_world_meshes(env, include_robot=True, include_statics=True, exclude_body_substrings=())
     ref_center = get_reference_center(meshes, keyword="table")
+    
+    # Compute bounds
+    bounds_min = np.array([-cube_half, -cube_half, -cube_half], dtype=np.float32)
+    bounds_max = np.array([cube_half, cube_half, cube_half], dtype=np.float32)
+    
+    # Compute adjusted center with direction
+    adjusted_center = ref_center.copy()
+    
+    # Calculate direction vector if needed (robot0_link0 -> gripper0_right_right_gripper)
+    if direction_vec is None and (direction_offset != 0.0 or align_forward_to_neg_x):
+        # Find body IDs
+        anchor_body_name = "robot0_link0"
+        target_body_name = "gripper0_right_right_gripper"
+        try:
+            anchor_body_id = env.sim.model.body_name2id(anchor_body_name)
+            target_body_id = env.sim.model.body_name2id(target_body_name)
+            
+            anchor_pos = env.sim.data.body_xpos[anchor_body_id].copy()
+            target_pos = env.sim.data.body_xpos[target_body_id].copy()
+            
+            direction = target_pos - anchor_pos
+            direction[2] = 0  # Project to xy plane
+            norm = np.linalg.norm(direction)
+            if norm > 1e-6:
+                direction_vec = (direction / norm).astype(np.float32)
+                
+                # Snap to axis-aligned direction (same logic as generate_tracking_data.py)
+                di_x = direction_vec[0]
+                di_y = direction_vec[1]
+                if abs(di_x) >= abs(di_y):
+                    if di_x >= 0:
+                        direction_vec[0] = 1.0
+                        direction_vec[1] = 0.0
+                    else:
+                        direction_vec[0] = -1.0
+                        direction_vec[1] = 0.0
+                else:
+                    if di_y >= 0:
+                        direction_vec[0] = 0.0
+                        direction_vec[1] = 1.0
+                    else:
+                        direction_vec[0] = 0.0
+                        direction_vec[1] = -1.0
+        except Exception as e:
+            logger.warning(f"Could not compute direction vector: {e}")
+            direction_vec = None
+    
+    # Apply direction offset
+    if direction_vec is not None and direction_offset != 0.0:
+        adjusted_center = adjusted_center + direction_offset * direction_vec
+    
+    # Store recenter origin on first call
+    if recenter_points and recenter_origin is None:
+        recenter_origin = adjusted_center.copy()
+    
+    # Filter meshes
     filtered = [m for m in meshes if include_table or "table" not in m["name"].lower()]
-    cropped = center_and_crop_meshes(filtered, ref_center, cube_half)
+    
+    # Exclude walls
+    filtered = [
+        m for m in filtered
+        if not ("world" in m["name"].lower() and "visual" in m["name"].lower())
+    ]
+    
+    # Center and crop meshes
+    cropped = []
+    for mesh in filtered:
+        verts = mesh["verts"] - adjusted_center
+        faces = mesh["faces"]
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        tri = verts[faces]
+        tri_min = tri.min(axis=1)
+        tri_max = tri.max(axis=1)
+        overlap = (
+            (tri_min[:, 0] <= bounds_max[0])
+            & (tri_max[:, 0] >= bounds_min[0])
+            & (tri_min[:, 1] <= bounds_max[1])
+            & (tri_max[:, 1] >= bounds_min[1])
+            & (tri_min[:, 2] <= bounds_max[2])
+            & (tri_max[:, 2] >= bounds_min[2])
+        )
+        faces_filtered = faces[overlap]
+        if len(faces_filtered) == 0:
+            continue
+        cropped.append({
+            "name": mesh["name"],
+            "verts": verts,
+            "faces": faces_filtered,
+        })
+    
+    # Merge meshes
     verts_list, faces_list = [], []
     vert_offset = 0
     for m in cropped:
-        if "verts" not in m or "faces" not in m:
-            continue
         verts = m["verts"]
         faces = m["faces"] + vert_offset
         verts_list.append(verts)
@@ -383,11 +526,15 @@ def pointcloud_from_env(env, cube_half: float, num_points: int, include_table: b
         vert_offset += verts.shape[0]
 
     if not verts_list or not faces_list:
-        return np.zeros((num_points, 3), dtype=np.float32)
+        pts = np.zeros((num_points, 3), dtype=np.float32)
+        if recenter_points and recenter_origin is not None:
+            pts = pts - recenter_origin
+        return pts, recenter_origin, direction_vec
 
     verts_all = np.concatenate(verts_list, axis=0)
     faces_all = np.concatenate(faces_list, axis=0)
 
+    # Sample points using Open3D
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(verts_all.astype(np.float64))
     mesh.triangles = o3d.utility.Vector3iVector(faces_all.astype(np.int32))
@@ -396,7 +543,16 @@ def pointcloud_from_env(env, cube_half: float, num_points: int, include_table: b
     mesh.remove_non_manifold_edges()
     pc_o3d = mesh.sample_points_uniformly(num_points)
     pts = np.asarray(pc_o3d.points, dtype=np.float32)
-    return pts
+    
+    # Apply transformations
+    if recenter_points and recenter_origin is not None:
+        pts = pts - (adjusted_center - recenter_origin)
+        
+    if align_forward_to_neg_x and direction_vec is not None and recenter_points:
+        # Rotate around origin (after recentering)
+        pts = _align_points_to_neg_x(pts, direction_vec, center=np.zeros(3, dtype=np.float32))
+    
+    return pts, recenter_origin, direction_vec
 
 
 def save_pc_tensor_as_ply(pc_tensor: torch.Tensor, path: Path, batch_idx: int = 0) -> None:
@@ -404,6 +560,94 @@ def save_pc_tensor_as_ply(pc_tensor: torch.Tensor, path: Path, batch_idx: int = 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pc_np)
     o3d.io.write_point_cloud(str(path), pcd)
+
+
+def save_pc_np_as_ply(pc_np: np.ndarray, path: Path) -> None:
+    """Save numpy pointcloud array as PLY file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc_np.astype(np.float64))
+    o3d.io.write_point_cloud(str(path), pcd)
+    logger.info(f"Saved pointcloud to {path}")
+
+
+def save_pointcloud_image(
+    pointcloud: np.ndarray,
+    image_path: Path,
+    max_points: Optional[int] = None,
+    title: str = 'Pointcloud',
+) -> None:
+    """
+    Save pointcloud visualization as image (same as finetune_libero.py).
+    
+    Args:
+        pointcloud: Input pointcloud (N, 3)
+        image_path: Path to save the image
+        max_points: Maximum points to render
+        title: Title for the plot
+    """
+    if pointcloud.size == 0:
+        return
+    
+    image_path = Path(image_path)
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Downsample if needed
+    if max_points and pointcloud.shape[0] > max_points:
+        indices = np.linspace(0, pointcloud.shape[0] - 1, max_points, dtype=int)
+        pointcloud = pointcloud[indices]
+    
+    fig = None
+    try:
+        import time
+        start_time = time.time()
+        
+        # Create figure
+        fig = plt.figure(figsize=(6.4, 4.8), dpi=80)
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_title(title, fontsize=12, pad=10)
+        ax.set_axis_off()
+        
+        # Center pointcloud
+        center = pointcloud.mean(axis=0, keepdims=True)
+        pc_centered = pointcloud - center
+        max_range = np.linalg.norm(pc_centered, axis=1).max() + 1e-6
+        max_range *= 1.2  # Add margin
+        
+        # Set view limits
+        ax.set_xlim3d([-max_range, max_range])
+        ax.set_ylim3d([-max_range, max_range])
+        ax.set_zlim3d([-max_range, max_range])
+        
+        # Set view angle
+        ax.view_init(elev=20.0, azim=45.0)
+        
+        # Plot points
+        ax.scatter(
+            pc_centered[:, 0],
+            pc_centered[:, 1],
+            pc_centered[:, 2],
+            c='blue',
+            marker='o',
+            s=3,
+            alpha=0.6
+        )
+        
+        plt.tight_layout()
+        fig.savefig(image_path, dpi=80, bbox_inches='tight')
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Saved pointcloud image to {image_path} (took {elapsed:.2f}s)")
+    except Exception as e:
+        logger.warning(f"Failed to save pointcloud image to {image_path}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if fig is not None:
+            try:
+                plt.close(fig)
+            except:
+                pass
 
 
 def save_sequence_video(points_seq: np.ndarray, video_path: Path, fps: int = 5, elev: float = 20.0, azim: float = 45.0):
@@ -588,10 +832,22 @@ def run_episode(
     replay_images = []
     max_steps = cfg.max_episode_steps
 
+    # Initialize recenter_origin and direction_vec for consistent pointcloud generation
+    recenter_origin = None
+    direction_vec = None
+
     # initial pointcloud
     if cfg.point_visualize or cfg.use_pointcloud_input:
-        pc_np = pointcloud_from_env(
-            env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
+        pc_np, recenter_origin, direction_vec = pointcloud_from_env(
+            env,
+            cube_half=cfg.pointcloud_cube_half,
+            num_points=cfg.pointcloud_num_points,
+            include_table=cfg.include_table,
+            recenter_origin=recenter_origin,
+            direction_vec=direction_vec,
+            recenter_points=True,
+            align_forward_to_neg_x=True,
+            direction_offset=0.5,
         )
     
     # Normalize pointcloud if statistics are available and normalization is enabled
@@ -601,12 +857,40 @@ def run_episode(
     device = model.device if hasattr(model, "device") else 0
     if cfg.point_visualize or cfg.use_pointcloud_input:
         pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+    
+    # Setup visualization directories
+    pc_viz_dir = None
+    if cfg.visualize_pc_image or cfg.save_pc_ply or cfg.save_pc_debug:
+        pc_viz_dir = Path(cfg.rollout_dir) / DATE / "pointcloud_viz"
+        pc_viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save initial pointcloud (step 0)
+        if cfg.point_visualize or cfg.use_pointcloud_input:
+            # Denormalize for visualization
+            pc_denorm = pc_np.copy()
+            if cfg.normalize_pointcloud and dataset_statistics and "pointcloud" in dataset_statistics:
+                pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
+                pc_std = np.array(dataset_statistics["pointcloud"]["std"])
+                pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
+                pc_denorm[:, :3] = pc_np[:, :3] * pc_std + pc_mean
+            
+            if cfg.visualize_pc_image:
+                save_pointcloud_image(
+                    pc_denorm,
+                    pc_viz_dir / "pointcloud_step_0000.png",
+                    max_points=cfg.pc_viz_max_points,
+                    title=f'Pointcloud Step 0',
+                )
+            
+            if cfg.save_pc_ply:
+                save_pc_np_as_ply(pc_denorm, pc_viz_dir / "pointcloud_step_0000.ply")
+    
+    # Legacy pc_debug_dir for backward compatibility
     pc_debug_dir = None
-    if cfg.point_visualize and (cfg.save_pc_debug or cfg.point_visualize):
+    if cfg.point_visualize and cfg.save_pc_debug:
         pc_debug_dir = Path(cfg.rollout_dir) / DATE / "pc_debug"
         pc_debug_dir.mkdir(parents=True, exist_ok=True)
-        if cfg.save_pc_debug:
-            save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / "pc_init.ply")
+        save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / "pc_init.ply")
 
     success = False
     while t < max_steps:
@@ -738,21 +1022,51 @@ def run_episode(
             break
         t += 1
 
-        # refresh pointcloud
-        if cfg.point_visualize :
-            print('Refresh pointcloud')
-            pc_np = pointcloud_from_env(
-                env, cube_half=cfg.pointcloud_cube_half, num_points=cfg.pointcloud_num_points, include_table=cfg.include_table
+        # refresh pointcloud and visualize
+        if cfg.point_visualize or cfg.use_pointcloud_input:
+            # Regenerate pointcloud
+            pc_np, _, _ = pointcloud_from_env(
+                env,
+                cube_half=cfg.pointcloud_cube_half,
+                num_points=cfg.pointcloud_num_points,
+                include_table=cfg.include_table,
+                recenter_origin=recenter_origin,
+                direction_vec=direction_vec,
+                recenter_points=True,
+                align_forward_to_neg_x=True,
+                direction_offset=0.5,
             )
             
             # Normalize pointcloud if statistics are available and normalization is enabled
-            if cfg.normalize_pointcloud :
+            if cfg.normalize_pointcloud:
                 pc_np = normalize_pointcloud(pc_np, dataset_statistics)
             
             pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+            
+            # Save visualization at specified frequency
+            if pc_viz_dir is not None and t % cfg.pc_viz_freq == 0:
+                # Denormalize for visualization
+                pc_denorm = pc_np.copy()
+                if cfg.normalize_pointcloud and dataset_statistics and "pointcloud" in dataset_statistics:
+                    pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
+                    pc_std = np.array(dataset_statistics["pointcloud"]["std"])
+                    pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
+                    pc_denorm[:, :3] = pc_np[:, :3] * pc_std + pc_mean
+                
+                if cfg.visualize_pc_image:
+                    save_pointcloud_image(
+                        pc_denorm,
+                        pc_viz_dir / f"pointcloud_step_{t:04d}.png",
+                        max_points=cfg.pc_viz_max_points,
+                        title=f'Pointcloud Step {t}',
+                    )
+                
+                if cfg.save_pc_ply:
+                    save_pc_np_as_ply(pc_denorm, pc_viz_dir / f"pointcloud_step_{t:04d}.ply")
+            
+            # Legacy pc_debug for backward compatibility
             if pc_debug_dir is not None and cfg.save_pc_debug:
                 save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
-            print('Refresh pointcloud done')
 
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)

@@ -526,6 +526,98 @@ class PointTrackingHeadWithPointInput(nn.Module):
 #         return tracking
 
 
+class LastPointcloudHead(nn.Module):
+    """
+    Predicts the final pointcloud position (not tracking sequence) from action embeddings.
+    
+    Key differences from PointTrackingHead:
+    - Processes each timestep with MLPResNet (same as PointTrackingHeadWithPointInput)
+    - Fuses action embeddings across time dimension (T -> 1)
+    - Outputs single pointcloud prediction instead of tracking sequence
+    - Uses pointcloud statistics for normalization (not tracking statistics)
+    """
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        point_hidden_dim=4096,
+        num_points=1024,
+        tracking_dim=3,
+        num_blocks: int = 2,
+    ):
+        super().__init__()
+        self.num_points = num_points
+        self.tracking_dim = tracking_dim
+        
+        # Process each timestep (same as PointTrackingHeadWithPointInput)
+        self.ctx_mlp = MLPResNet(
+            num_blocks=num_blocks,
+            input_dim=input_dim * ACTION_DIM,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+        )
+        
+        # Temporal fusion: Fuse T timesteps to 1
+        self.temporal_fusion = nn.Sequential(
+            nn.Linear(NUM_ACTIONS_CHUNK * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
+        # Point encoder (same as PointTrackingHeadWithPointInput)
+        self.point_mlp = nn.Sequential(
+            nn.Linear(tracking_dim, point_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(point_hidden_dim, hidden_dim),
+        )
+        
+        # Fusion MLP (same as PointTrackingHeadWithPointInput)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, tracking_dim),
+        )
+    
+    def predict_tracking(self, actions_hidden_states: torch.Tensor, pointcloud: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            actions_hidden_states: Hidden states for action tokens, shape (B, T * action_dim, hidden_dim).
+            pointcloud: Base pointcloud, shape (B, num_points, tracking_dim).
+        
+        Returns:
+            torch.Tensor: Predicted final pointcloud with shape (B, 1, num_points, tracking_dim).
+                         Note: Output has shape (B, 1, N, 3) to match tracking head interface,
+                         but only the single timestep is meaningful.
+        """
+        if pointcloud is None:
+            raise ValueError("LastPointcloudHead requires a pointcloud input.")
+        
+        batch_size = actions_hidden_states.shape[0]
+        
+        # Process each timestep with MLPResNet (same as PointTrackingHeadWithPointInput)
+        ctx = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)  # (B, T, action_dim*hidden_dim)
+        ctx_feat = self.ctx_mlp(ctx)  # (B, T, hidden_dim)
+        
+        # Fuse temporal dimension: (B, T, hidden_dim) -> (B, T*hidden_dim) -> (B, hidden_dim)
+        ctx_flat = ctx_feat.reshape(batch_size, -1)  # (B, T*hidden_dim)
+        fused_actions = self.temporal_fusion(ctx_flat)  # (B, hidden_dim)
+        
+        # Encode pointcloud
+        point_feat = self.point_mlp(pointcloud)  # (B, N, hidden_dim)
+        
+        # Expand fused actions to all points
+        fused_actions_expanded = fused_actions.unsqueeze(1).expand(-1, self.num_points, -1)  # (B, N, hidden_dim)
+        
+        # Fusion
+        fusion = torch.cat([fused_actions_expanded, point_feat], dim=-1)  # (B, N, 2*hidden_dim)
+        final_pointcloud = self.fusion_mlp(fusion)  # (B, N, tracking_dim)
+        
+        # Add time dimension to match tracking head interface: (B, N, 3) -> (B, 1, N, 3)
+        final_pointcloud = final_pointcloud.unsqueeze(1)
+        
+        return final_pointcloud
+
+
 ## parallel : v1
 class PointTrackingHeadParallel(nn.Module):
     def __init__(
