@@ -836,8 +836,11 @@ def run_episode(
     recenter_origin = None
     direction_vec = None
 
+    # Check if we need to generate pointcloud
+    need_pointcloud = cfg.point_visualize or cfg.use_pointcloud_input or cfg.visualize_pc_image or cfg.save_pc_ply
+
     # initial pointcloud
-    if cfg.point_visualize or cfg.use_pointcloud_input:
+    if need_pointcloud:
         pc_np, recenter_origin, direction_vec = pointcloud_from_env(
             env,
             cube_half=cfg.pointcloud_cube_half,
@@ -851,11 +854,12 @@ def run_episode(
         )
     
     # Normalize pointcloud if statistics are available and normalization is enabled
-    if (cfg.point_visualize or cfg.use_pointcloud_input) and cfg.normalize_pointcloud :
+    if need_pointcloud and cfg.normalize_pointcloud:
         pc_np = normalize_pointcloud(pc_np, dataset_statistics)
     
     device = model.device if hasattr(model, "device") else 0
-    if cfg.point_visualize or cfg.use_pointcloud_input:
+    pc_tensor = None
+    if cfg.use_pointcloud_input and need_pointcloud:
         pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
     
     # Setup visualization directories
@@ -865,7 +869,7 @@ def run_episode(
         pc_viz_dir.mkdir(parents=True, exist_ok=True)
         
         # Save initial pointcloud (step 0)
-        if cfg.point_visualize or cfg.use_pointcloud_input:
+        if need_pointcloud:
             # Denormalize for visualization
             pc_denorm = pc_np.copy()
             if cfg.normalize_pointcloud and dataset_statistics and "pointcloud" in dataset_statistics:
@@ -887,7 +891,7 @@ def run_episode(
     
     # Legacy pc_debug_dir for backward compatibility
     pc_debug_dir = None
-    if cfg.point_visualize and cfg.save_pc_debug:
+    if cfg.point_visualize and cfg.save_pc_debug and pc_tensor is not None:
         pc_debug_dir = Path(cfg.rollout_dir) / DATE / "pc_debug"
         pc_debug_dir.mkdir(parents=True, exist_ok=True)
         save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / "pc_init.ply")
@@ -1023,7 +1027,7 @@ def run_episode(
         t += 1
 
         # refresh pointcloud and visualize
-        if cfg.point_visualize or cfg.use_pointcloud_input:
+        if need_pointcloud:
             # Regenerate pointcloud
             pc_np, _, _ = pointcloud_from_env(
                 env,
@@ -1041,7 +1045,8 @@ def run_episode(
             if cfg.normalize_pointcloud:
                 pc_np = normalize_pointcloud(pc_np, dataset_statistics)
             
-            pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+            if cfg.use_pointcloud_input:
+                pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
             
             # Save visualization at specified frequency
             if pc_viz_dir is not None and t % cfg.pc_viz_freq == 0:
@@ -1065,7 +1070,7 @@ def run_episode(
                     save_pc_np_as_ply(pc_denorm, pc_viz_dir / f"pointcloud_step_{t:04d}.ply")
             
             # Legacy pc_debug for backward compatibility
-            if pc_debug_dir is not None and cfg.save_pc_debug:
+            if pc_debug_dir is not None and cfg.save_pc_debug and pc_tensor is not None:
                 save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
 
     # except Exception as e:
