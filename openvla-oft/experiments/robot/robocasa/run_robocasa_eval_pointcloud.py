@@ -11,8 +11,9 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import glob
+import robocasa
 
 import draccus
 import imageio.v2 as imageio
@@ -54,8 +55,6 @@ from robocasa.utils.dataset_registry import SINGLE_STAGE_TASK_DATASETS
 from robosuite.controllers import load_composite_controller_config
 import robosuite
 
-from pathlib import Path
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +62,118 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+# ===============================
+#  Mesh helpers (from generate_tracking_data.py)
+# ===============================
+
+GEOM_MESH = 7
+GEOM_BOX = 6
+
+
+def _geom_mesh_in_world(sim, geom_id: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    model, data = sim.model, sim.data
+    mesh_id = model.geom_dataid[geom_id]
+    if mesh_id < 0:
+        return None
+    v_adr = model.mesh_vertadr[mesh_id]
+    v_num = model.mesh_vertnum[mesh_id]
+    f_adr = model.mesh_faceadr[mesh_id]
+    f_num = model.mesh_facenum[mesh_id]
+    verts_local = model.mesh_vert[v_adr : v_adr + v_num]
+    faces = model.mesh_face[f_adr : f_adr + f_num]
+    R = data.geom_xmat[geom_id].reshape(3, 3)
+    t = data.geom_xpos[geom_id]
+    verts_world = verts_local @ R.T + t
+    return verts_world, faces
+
+
+def _box_geom_in_world(sim, geom_id: int) -> Tuple[np.ndarray, np.ndarray]:
+    model, data = sim.model, sim.data
+    hx, hy, hz = model.geom_size[geom_id]
+    corners = np.array(
+        [
+            [-hx, -hy, -hz],
+            [-hx, -hy, hz],
+            [-hx, hy, -hz],
+            [-hx, hy, hz],
+            [hx, -hy, -hz],
+            [hx, -hy, hz],
+            [hx, hy, -hz],
+            [hx, hy, hz],
+        ]
+    )
+    R = data.geom_xmat[geom_id].reshape(3, 3)
+    t = data.geom_xpos[geom_id]
+    verts_world = corners @ R.T + t
+    faces = np.array(
+        [
+            [0, 1, 3],
+            [0, 3, 2],
+            [4, 6, 7],
+            [4, 7, 5],
+            [0, 4, 5],
+            [0, 5, 1],
+            [2, 3, 7],
+            [2, 7, 6],
+            [0, 2, 6],
+            [0, 6, 4],
+            [1, 5, 7],
+            [1, 7, 3],
+        ],
+        dtype=np.int32,
+    )
+    return verts_world, faces
+
+
+def collect_world_meshes(
+    env,
+    *,
+    include_robot: bool = True,
+    include_statics: bool = True,
+    exclude_body_substrings: Sequence[str] = (),
+) -> List[Dict[str, Any]]:
+    sim, model = env.sim, env.sim.model
+    meshes: List[Dict[str, Any]] = []
+    for geom_id in range(model.ngeom):
+        body_id = model.geom_bodyid[geom_id]
+        body_name = model.body_id2name(body_id) or f"body_{body_id}"
+        lname = body_name.lower()
+        if not include_robot and (
+            "panda" in lname or "robot" in lname or "gripper" in lname
+        ):
+            continue
+        is_static = body_id == 0 or any(word in lname for word in ("floor", "table", "ground"))
+        if not include_statics and is_static:
+            continue
+        if any(substr.lower() in lname for substr in exclude_body_substrings):
+            continue
+
+        geom_type = model.geom_type[geom_id]
+        mesh: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        if geom_type == GEOM_MESH:
+            mesh = _geom_mesh_in_world(sim, geom_id)
+        elif geom_type == GEOM_BOX:
+            mesh = _box_geom_in_world(sim, geom_id)
+        if mesh is None:
+            continue
+        verts_world, faces = mesh
+        meshes.append(
+            {
+                "name": f"{body_name}_geom{geom_id}",
+                "verts": verts_world,
+                "faces": faces,
+            }
+        )
+    return meshes
+
+
+def get_reference_center(meshes: Sequence[Dict[str, Any]], keyword: str = "table") -> np.ndarray:
+    for mesh in meshes:
+        if keyword in mesh["name"].lower() and len(mesh["verts"]) > 0:
+            return mesh["verts"].mean(axis=0)
+    return np.zeros(3)
 
 
 @dataclass
@@ -416,11 +527,6 @@ def pointcloud_from_env(
     Returns:
         Tuple of (points, recenter_origin, direction_vec)
     """
-    from export_gt_pointcloud import (  # type: ignore  # noqa: E402
-        collect_world_meshes,
-        get_reference_center,
-    )
-
     # Collect meshes
     meshes = collect_world_meshes(env, include_robot=True, include_statics=True, exclude_body_substrings=())
     ref_center = get_reference_center(meshes, keyword="table")
