@@ -176,6 +176,19 @@ def get_reference_center(meshes: Sequence[Dict[str, Any]], keyword: str = "table
     return np.zeros(3)
 
 
+def get_body_center(env, body_id: Optional[int]) -> Optional[np.ndarray]:
+    if body_id is None:
+        return None
+    return env.sim.data.body_xpos[body_id].copy()
+
+
+def get_anchor_center(env, meshes, anchor_body_id: Optional[int], keyword: str = "table") -> np.ndarray:
+    center = get_body_center(env, anchor_body_id)
+    if center is None:
+        center = get_reference_center(meshes, keyword=keyword)
+    return center
+
+
 @dataclass
 class GenerateConfig:
     # fmt: off
@@ -529,7 +542,15 @@ def pointcloud_from_env(
     """
     # Collect meshes
     meshes = collect_world_meshes(env, include_robot=True, include_statics=True, exclude_body_substrings=())
-    ref_center = get_reference_center(meshes, keyword="table")
+    
+    # Use anchor_body (robot0_link0) for center, same as generate_tracking_data.sh
+    anchor_body_name = "robot0_link0"
+    try:
+        anchor_body_id = env.sim.model.body_name2id(anchor_body_name)
+    except Exception:
+        anchor_body_id = None
+    
+    ref_center = get_anchor_center(env, meshes, anchor_body_id, keyword="table")
     
     # Compute bounds
     bounds_min = np.array([-cube_half, -cube_half, -cube_half], dtype=np.float32)
