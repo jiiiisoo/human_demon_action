@@ -450,22 +450,125 @@ def process_action(action, model_family):
     return action
 
 
-def sample_points_on_mesh(verts: np.ndarray, faces: np.ndarray, n_samples: int) -> np.ndarray:
-    """Sample points uniformly on a mesh surface using face areas."""
-    if len(faces) == 0 or len(verts) == 0 or n_samples <= 0:
+def _build_tracking_points_from_faces(
+    env,
+    cube_center: np.ndarray,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    max_points: int,
+    include_table: bool = False,
+    include_wall: bool = False,
+    table_weight: float = 1.0,
+    robot_weight: float = 6.0,
+    gripper_weight: float = 20.0,
+) -> np.ndarray:
+    """
+    Sample points from mesh faces with weighted sampling (same as generate_tracking_data.py).
+    
+    This uses the same weighted sampling strategy as training data generation:
+    - Robot meshes: 6x weight
+    - Gripper meshes: 20x weight
+    - Table meshes: 1x weight
+    """
+    sim = env.sim
+    model = sim.model
+    
+    face_tris: List[np.ndarray] = []
+    face_areas: List[float] = []
+    
+    cube_center = np.asarray(cube_center, dtype=np.float32)
+    bounds_min = np.asarray(bounds_min, dtype=np.float32)
+    bounds_max = np.asarray(bounds_max, dtype=np.float32)
+    cube_min = cube_center + bounds_min
+    cube_max = cube_center + bounds_max
+    
+    for geom_id in range(model.ngeom):
+        body_id = model.geom_bodyid[geom_id]
+        body_name = model.body_id2name(body_id) or f"body_{body_id}"
+        lname = body_name.lower()
+        
+        # Skip based on include flags
+        if not include_table and "table" in lname:
+            continue
+        if not include_wall and ("world" in lname or "mount0" in lname or lname.startswith("wall")):
+            continue
+        
+        # Get mesh geometry
+        mesh_id = model.geom_dataid[geom_id]
+        if mesh_id >= 0:
+            v_adr = model.mesh_vertadr[mesh_id]
+            v_num = model.mesh_vertnum[mesh_id]
+            f_adr = model.mesh_faceadr[mesh_id]
+            f_num = model.mesh_facenum[mesh_id]
+            if v_num == 0 or f_num == 0:
+                continue
+            local_verts = model.mesh_vert[v_adr : v_adr + v_num]
+            faces = model.mesh_face[f_adr : f_adr + f_num]
+        else:
+            # Box geometry
+            hx, hy, hz = model.geom_size[geom_id]
+            local_verts = np.array([
+                [-hx, -hy, -hz], [-hx, -hy, hz], [-hx, hy, -hz], [-hx, hy, hz],
+                [hx, -hy, -hz], [hx, -hy, hz], [hx, hy, -hz], [hx, hy, hz],
+            ], dtype=np.float32)
+            faces = np.array([
+                [0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5],
+                [0, 4, 5], [0, 5, 1], [2, 3, 7], [2, 7, 6],
+                [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3],
+            ], dtype=np.int32)
+        
+        # Transform to world coordinates
+        R = sim.data.geom_xmat[geom_id].reshape(3, 3)
+        t = sim.data.geom_xpos[geom_id]
+        world_verts = local_verts @ R.T + t
+        
+        # Filter faces that overlap with cube
+        pose_triangles = world_verts[faces]
+        tri_min = pose_triangles.min(axis=1)
+        tri_max = pose_triangles.max(axis=1)
+        overlap = np.all(tri_min <= cube_max, axis=1) & np.all(tri_max >= cube_min, axis=1)
+        valid_tris = pose_triangles[overlap]
+        
+        if len(valid_tris) == 0:
+            continue
+        
+        # Compute areas with weights
+        areas = 0.5 * np.linalg.norm(np.cross(valid_tris[:, 1] - valid_tris[:, 0], valid_tris[:, 2] - valid_tris[:, 0]), axis=1)
+        
+        # Apply weights (same as generate_tracking_data.py)
+        if "table" in lname:
+            areas = areas * table_weight
+        if lname.startswith("robot0"):
+            areas = areas * robot_weight
+        if lname.startswith("gripper0"):
+            areas = areas * gripper_weight
+        
+        face_tris.extend(list(valid_tris))
+        face_areas.extend(list(areas))
+    
+    if not face_tris:
         return np.zeros((0, 3), dtype=np.float32)
-    tri = verts[faces]  # (F, 3, 3)
-    areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
-    total = areas.sum()
-    if total <= 1e-9:
-        return np.zeros((0, 3), dtype=np.float32)
-    probs = areas / total
-    face_idx = np.random.choice(len(faces), size=n_samples, p=probs)
-    tri_sel = tri[face_idx]
-    r1 = np.sqrt(np.random.rand(n_samples, 1))
-    r2 = np.random.rand(n_samples, 1)
-    samples = tri_sel[:, 0] + r1 * (tri_sel[:, 1] - tri_sel[:, 0]) + r2 * (tri_sel[:, 2] - tri_sel[:, 0])
-    return samples.astype(np.float32)
+    
+    # Sample points using weighted face areas
+    face_areas_np = np.asarray(face_areas, dtype=np.float64)
+    probs = face_areas_np / np.maximum(face_areas_np.sum(), 1e-6)
+    
+    points = []
+    max_attempts = max(max_points * 200, 5000)
+    attempts = 0
+    
+    while len(points) < max_points and attempts < max_attempts:
+        attempts += 1
+        idx = int(np.random.choice(len(face_tris), p=probs))
+        tri_world = face_tris[idx]
+        barycentric = np.random.dirichlet(alpha=np.ones(3)).astype(np.float32)
+        point = barycentric[0] * tri_world[0] + barycentric[1] * tri_world[1] + barycentric[2] * tri_world[2]
+        
+        # Check if point is inside cube
+        if np.all(point >= cube_min) and np.all(point <= cube_max):
+            points.append(point)
+    
+    return np.array(points, dtype=np.float32) if points else np.zeros((0, 3), dtype=np.float32)
 
 
 def _allocate_counts_by_area(meshes, total_points: int, min_per_mesh: int):
@@ -606,70 +709,26 @@ def pointcloud_from_env(
     if recenter_points and recenter_origin is None:
         recenter_origin = adjusted_center.copy()
     
-    # Filter meshes
-    filtered = [m for m in meshes if include_table or "table" not in m["name"].lower()]
+    # Use weighted sampling (same as generate_tracking_data.py)
+    # This applies robot_weight=6.0, gripper_weight=20.0 automatically
+    pts = _build_tracking_points_from_faces(
+        env=env,
+        cube_center=adjusted_center,
+        bounds_min=bounds_min,
+        bounds_max=bounds_max,
+        max_points=num_points,
+        include_table=include_table,
+        include_wall=False,  # Same as --exclude_wall in training
+        table_weight=1.0,     # Default from generate_tracking_data.py
+        robot_weight=6.0,     # Default from generate_tracking_data.py
+        gripper_weight=20.0,  # Default from generate_tracking_data.py
+    )
     
-    # Exclude walls
-    filtered = [
-        m for m in filtered
-        if not ("world" in m["name"].lower() and "visual" in m["name"].lower())
-    ]
-    
-    # Center and crop meshes
-    cropped = []
-    for mesh in filtered:
-        verts = mesh["verts"] - adjusted_center
-        faces = mesh["faces"]
-        if len(verts) == 0 or len(faces) == 0:
-            continue
-        tri = verts[faces]
-        tri_min = tri.min(axis=1)
-        tri_max = tri.max(axis=1)
-        overlap = (
-            (tri_min[:, 0] <= bounds_max[0])
-            & (tri_max[:, 0] >= bounds_min[0])
-            & (tri_min[:, 1] <= bounds_max[1])
-            & (tri_max[:, 1] >= bounds_min[1])
-            & (tri_min[:, 2] <= bounds_max[2])
-            & (tri_max[:, 2] >= bounds_min[2])
-        )
-        faces_filtered = faces[overlap]
-        if len(faces_filtered) == 0:
-            continue
-        cropped.append({
-            "name": mesh["name"],
-            "verts": verts,
-            "faces": faces_filtered,
-        })
-    
-    # Merge meshes
-    verts_list, faces_list = [], []
-    vert_offset = 0
-    for m in cropped:
-        verts = m["verts"]
-        faces = m["faces"] + vert_offset
-        verts_list.append(verts)
-        faces_list.append(faces)
-        vert_offset += verts.shape[0]
-
-    if not verts_list or not faces_list:
+    if pts.size == 0:
         pts = np.zeros((num_points, 3), dtype=np.float32)
         if recenter_points and recenter_origin is not None:
             pts = pts - recenter_origin
         return pts, recenter_origin, direction_vec
-
-    verts_all = np.concatenate(verts_list, axis=0)
-    faces_all = np.concatenate(faces_list, axis=0)
-
-    # Sample points using Open3D
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(verts_all.astype(np.float64))
-    mesh.triangles = o3d.utility.Vector3iVector(faces_all.astype(np.int32))
-    mesh.remove_duplicated_vertices()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_non_manifold_edges()
-    pc_o3d = mesh.sample_points_uniformly(num_points)
-    pts = np.asarray(pc_o3d.points, dtype=np.float32)
     
     # Apply transformations
     if recenter_points and recenter_origin is not None:
