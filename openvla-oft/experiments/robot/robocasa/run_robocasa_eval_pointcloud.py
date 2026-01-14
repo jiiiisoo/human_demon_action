@@ -189,6 +189,24 @@ def get_anchor_center(env, meshes, anchor_body_id: Optional[int], keyword: str =
     return center
 
 
+def compute_adjusted_center(
+    ref_center: np.ndarray,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    cube_offset: Tuple[float, float, float],
+    cube_offset_m: Tuple[float, float, float],
+) -> np.ndarray:
+    """
+    Compute adjusted center with cube_offset and cube_offset_m.
+    Same logic as generate_tracking_data.py.
+    """
+    frac = np.array(cube_offset, dtype=np.float32)
+    extra = np.array(cube_offset_m, dtype=np.float32)
+    span = bounds_max - bounds_min
+    shift = bounds_min + frac * span
+    return ref_center + shift + extra
+
+
 @dataclass
 class GenerateConfig:
     # fmt: off
@@ -624,7 +642,9 @@ def pointcloud_from_env(
     direction_vec: Optional[np.ndarray] = None,
     recenter_points: bool = True,
     align_forward_to_neg_x: bool = True,
-    direction_offset: float = 0.5,
+    cube_offset: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    cube_offset_m: Tuple[float, float, float] = (-0.5, 0.0, 0.0),
+    direction_offset: float = 0.0,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Extract pointcloud from environment matching the training data generation process.
@@ -638,6 +658,8 @@ def pointcloud_from_env(
         direction_vec: Direction vector for alignment (if None, will be computed)
         recenter_points: Whether to recenter points to origin
         align_forward_to_neg_x: Whether to align forward direction to -x
+        cube_offset: Offset of anchor within cube as fractions (x, y, z) in [0,1]
+        cube_offset_m: Additional cube-center offset in meters (x, y, z)
         direction_offset: Offset along direction vector for center adjustment
     
     Returns:
@@ -659,8 +681,8 @@ def pointcloud_from_env(
     bounds_min = np.array([-cube_half, -cube_half, -cube_half], dtype=np.float32)
     bounds_max = np.array([cube_half, cube_half, cube_half], dtype=np.float32)
     
-    # Compute adjusted center with direction
-    adjusted_center = ref_center.copy()
+    # Compute adjusted center with cube_offset and cube_offset_m
+    adjusted_center = compute_adjusted_center(ref_center, bounds_min, bounds_max, cube_offset, cube_offset_m)
     
     # Calculate direction vector if needed (robot0_link0 -> gripper0_right_right_gripper)
     if direction_vec is None and (direction_offset != 0.0 or align_forward_to_neg_x):
@@ -1036,7 +1058,9 @@ def run_episode(
             direction_vec=direction_vec,
             recenter_points=True,
             align_forward_to_neg_x=True,
-            direction_offset=0.5,
+            cube_offset=(0.5, 0.5, 0.5),  # Default from generate_tracking_data.py
+            cube_offset_m=(-0.5, 0.0, 0.0),  # Actual training data generation parameter
+            direction_offset=0.0,  # No direction offset used in training
         )
     
     # Normalize pointcloud if statistics are available and normalization is enabled
@@ -1224,7 +1248,9 @@ def run_episode(
                 direction_vec=direction_vec,
                 recenter_points=True,
                 align_forward_to_neg_x=True,
-                direction_offset=0.5,
+                cube_offset=(0.5, 0.5, 0.5),
+                cube_offset_m=(-0.5, 0.0, 0.0),
+                direction_offset=0.0,
             )
             
             # Normalize pointcloud if statistics are available and normalization is enabled
