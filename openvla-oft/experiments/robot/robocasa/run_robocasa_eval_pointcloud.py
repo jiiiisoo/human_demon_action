@@ -643,8 +643,8 @@ def pointcloud_from_env(
     recenter_points: bool = True,
     align_forward_to_neg_x: bool = True,
     cube_offset: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-    cube_offset_m: Tuple[float, float, float] = (-0.5, 0.0, 0.0),
-    direction_offset: float = 0.0,
+    cube_offset_m: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    direction_offset: float = 0.5,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Extract pointcloud from environment matching the training data generation process.
@@ -1062,8 +1062,8 @@ def run_episode(
             recenter_points=True,
             align_forward_to_neg_x=True,
             cube_offset=(0.5, 0.5, 0.5),  # Default from generate_tracking_data.py
-            cube_offset_m=(-0.5, 0.0, 0.0),  # Actual training data generation parameter
-            direction_offset=0.0,  # No direction offset used in training
+            cube_offset_m=(0.0, 0.0, 0.0),  # Default (no offset)
+            direction_offset=0.5,  # Actual training data generation parameter
         )
     
     # Normalize pointcloud if statistics are available and normalization is enabled
@@ -1252,8 +1252,8 @@ def run_episode(
                 recenter_points=True,
                 align_forward_to_neg_x=True,
                 cube_offset=(0.5, 0.5, 0.5),
-                cube_offset_m=(-0.5, 0.0, 0.0),
-                direction_offset=0.0,
+                cube_offset_m=(0.0, 0.0, 0.0),
+                direction_offset=0.5,
             )
             
             # Normalize pointcloud if statistics are available and normalization is enabled
