@@ -79,10 +79,12 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
+    OMY_F3M_CONSTANTS,
 )
 from prismatic.vla.datasets import LIBEROBatchTransform, RoboCasaBatchTransform
 from prismatic.vla.datasets.libero_hdf5_dataset import make_libero_hdf5_datasets
 from prismatic.vla.datasets.robocasa_hdf5_dataset import make_robocasa_hdf5_datasets
+from prismatic.vla.datasets.omy_f3m_hdf5_dataset import OmyF3mBatchTransform, make_omy_f3m_hdf5_datasets
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 # Sane Defaults
@@ -95,7 +97,7 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
     # Dataset selection
-    dataset_type: str = "libero"                     # Dataset type: "libero" or "robocasa"
+    dataset_type: str = "libero"                     # Dataset type: "libero", "robocasa", or "omy_f3m"
 
     # Dataset - LIBERO specific
     libero_data_dir: Path = Path("/scratch2/jisoo6687/libero/libero_goal_no_noops_track")  # Directory containing LIBERO HDF5 files
@@ -104,6 +106,10 @@ class FinetuneConfig:
     # Dataset - RoboCasa specific
     robocasa_data_dir: Path = Path("/weka/jisookim/dataset/robocasa/datasets/regenerate_single/regenerate_single")  # Directory containing RoboCasa HDF5 files
     robocasa_task_suite: str = "robocasa"            # RoboCasa task suite name
+
+    # Dataset - OMY F3M specific (real-world robot data converted from LeRobot v3.0)
+    omy_f3m_data_dir: Path = Path("/workspace/human_demon_action/robot_sample_data_hdf5")  # Directory containing OMY F3M HDF5 files
+    omy_f3m_task_suite: str = "omy_f3m_simple_santa_pri"  # OMY F3M task suite name (matches dataset folder name)
 
     data_root_dir: Path = Path("datasets/rlds")      # [Not used for HDF5 datasets] Directory containing RLDS datasets
     dataset_name: str = "libero"                     # [Not used for HDF5 datasets] Name of fine-tuning dataset
@@ -232,7 +238,12 @@ def get_run_id(cfg) -> str:
             run_id = "--".join(run_id.split("--")[:-1])
     else:
         # Use appropriate task suite based on dataset type
-        task_suite = cfg.robocasa_task_suite if cfg.dataset_type == "robocasa" else cfg.libero_task_suite
+        if cfg.dataset_type == "robocasa":
+            task_suite = cfg.robocasa_task_suite
+        elif cfg.dataset_type == "omy_f3m":
+            task_suite = cfg.omy_f3m_task_suite
+        else:
+            task_suite = cfg.libero_task_suite
         run_id = (
             f"{cfg.vla_path.split('/')[-1]}+{task_suite}"
             f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
@@ -1350,7 +1361,12 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    task_suite = cfg.robocasa_task_suite if cfg.dataset_type == "robocasa" else cfg.libero_task_suite
+    if cfg.dataset_type == "robocasa":
+        task_suite = cfg.robocasa_task_suite
+    elif cfg.dataset_type == "omy_f3m":
+        task_suite = cfg.omy_f3m_task_suite
+    else:
+        task_suite = cfg.libero_task_suite
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on {cfg.dataset_type.upper()} `{task_suite}`")
 
     # Get experiment run ID
@@ -1391,8 +1407,29 @@ def finetune(cfg: FinetuneConfig) -> None:
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
 
+    # Override constants based on dataset type
+    global NUM_ACTIONS_CHUNK, ACTION_DIM, PROPRIO_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
+
+    # If using OMY F3M dataset, override constants with OMY_F3M_CONSTANTS
+    if cfg.dataset_type == "omy_f3m":
+        print(f"\n[Constants] Using OMY_F3M_CONSTANTS for dataset_type='omy_f3m'")
+        NUM_ACTIONS_CHUNK = OMY_F3M_CONSTANTS["NUM_ACTIONS_CHUNK"]
+        ACTION_DIM = OMY_F3M_CONSTANTS["ACTION_DIM"]
+        PROPRIO_DIM = OMY_F3M_CONSTANTS["PROPRIO_DIM"]
+        ACTION_PROPRIO_NORMALIZATION_TYPE = OMY_F3M_CONSTANTS["ACTION_PROPRIO_NORMALIZATION_TYPE"]
+
+        # Update the constants in all relevant modules
+        import prismatic.vla.constants as constants_module
+        constants_module.NUM_ACTIONS_CHUNK = NUM_ACTIONS_CHUNK
+        constants_module.ACTION_DIM = ACTION_DIM
+        constants_module.PROPRIO_DIM = PROPRIO_DIM
+        constants_module.ACTION_PROPRIO_NORMALIZATION_TYPE = ACTION_PROPRIO_NORMALIZATION_TYPE
+
+        import prismatic.models.action_heads as action_heads_module
+        action_heads_module.NUM_ACTIONS_CHUNK = NUM_ACTIONS_CHUNK
+        action_heads_module.ACTION_DIM = ACTION_DIM
+
     # Override NUM_ACTIONS_CHUNK if specified via command line or load from checkpoint
-    global NUM_ACTIONS_CHUNK
     
     # If resuming, set up paths and load configuration from checkpoint
     checkpoint_dir = None
@@ -1768,7 +1805,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # =================================================================================
-    # DATASET LOADING - HDF5 DATASETS (LIBERO or RoboCasa)
+    # DATASET LOADING - HDF5 DATASETS (LIBERO, RoboCasa, or OMY F3M)
     # =================================================================================
 
     if cfg.dataset_type == "robocasa":
@@ -1793,6 +1830,42 @@ def finetune(cfg: FinetuneConfig) -> None:
         train_dataset, val_dataset = make_robocasa_hdf5_datasets(
             data_dir=cfg.robocasa_data_dir,
             task_suite=cfg.robocasa_task_suite,
+            batch_transform=batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+            num_images_in_input=cfg.num_images_in_input,
+            tracking_tracks_root=cfg.tracking_tracks_root,
+            action_chunk_size=NUM_ACTIONS_CHUNK,
+            window_stride=cfg.window_stride,
+            use_val_set=cfg.use_val_set,
+            normalize_pointcloud=cfg.normalize_pointcloud,
+            normalize_tracking=cfg.normalize_tracking,
+            precomputed_statistics_path=cfg.precomputed_statistics_path,
+            filename=cfg.tracking_tracks_filename,
+        )
+    elif cfg.dataset_type == "omy_f3m":
+        # OMY F3M dataset loading (real-world robot data converted from LeRobot v3.0)
+        # num_images_in_input: 1=cam_third only, 3=cam_third+cam_top+cam_wrist
+        print(f"\n[Dataset] Loading OMY F3M dataset from {cfg.omy_f3m_data_dir}")
+
+        # Create batch transform for OMY F3M
+        batch_transform = OmyF3mBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            num_images_in_input=cfg.num_images_in_input,
+            use_proprio=cfg.use_proprio,
+            use_pointcloud_input=cfg.use_pointcloud_input,
+            use_tracking_head=cfg.use_tracking_head,
+            tracking_use_pointcloud_input=cfg.tracking_use_pointcloud_input,
+        )
+
+        # Create OMY F3M HDF5 datasets
+        train_dataset, val_dataset = make_omy_f3m_hdf5_datasets(
+            data_dir=cfg.omy_f3m_data_dir,
+            task_suite=cfg.omy_f3m_task_suite,
             batch_transform=batch_transform,
             resize_resolution=tuple(vla.module.config.image_sizes),
             shuffle_buffer_size=cfg.shuffle_buffer_size,

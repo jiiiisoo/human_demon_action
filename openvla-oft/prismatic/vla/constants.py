@@ -44,6 +44,13 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+OMY_F3M_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 10,  # 10 FPS, 1 second chunk
+    "ACTION_DIM": 7,          # 6 joint + 1 gripper
+    "PROPRIO_DIM": 7,         # 6 joint + 1 gripper
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS,
+}
+
 
 # Function to detect robot platform from command line arguments
 def detect_robot_platform():
@@ -55,6 +62,8 @@ def detect_robot_platform():
         return "ALOHA"
     elif "bridge" in cmd_args:
         return "BRIDGE"
+    elif "omy_f3m" in cmd_args:
+        return "OMY_F3M"
     else:
         # Default to LIBERO if unclear
         return "LIBERO"
@@ -70,6 +79,8 @@ elif ROBOT_PLATFORM == "ALOHA":
     constants = ALOHA_CONSTANTS
 elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
+elif ROBOT_PLATFORM == "OMY_F3M":
+    constants = OMY_F3M_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
