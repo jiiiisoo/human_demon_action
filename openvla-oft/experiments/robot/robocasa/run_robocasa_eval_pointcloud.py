@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import glob
 import robocasa
+import time
 
 import draccus
 import imageio.v2 as imageio
@@ -263,6 +264,10 @@ class GenerateConfig:
     wandb_project: str = "your-wandb-project"
     seed: int = 7
     num_episodes : int = 50
+    
+    # Task slicing for multi-GPU evaluation
+    task_slice_start: Optional[int] = None
+    task_slice_end: Optional[int] = None
     # fmt: on
 
 def create_eval_env(
@@ -1074,7 +1079,9 @@ def run_episode(
     need_pointcloud = cfg.point_visualize or cfg.use_pointcloud_input or cfg.visualize_pc_image or cfg.save_pc_ply
 
     # initial pointcloud
+    # print(f'start time for pointcloud generation: {time.time()}')
     if need_pointcloud:
+        start_time = time.time()
         pc_np, recenter_origin, direction_vec = pointcloud_from_env(
             env,
             cube_half=cfg.pointcloud_cube_half,
@@ -1088,7 +1095,8 @@ def run_episode(
             cube_offset_m=(0.0, 0.0, 0.0),  # Default (no offset)
             direction_offset=0.5,  # Actual training data generation parameter
         )
-    
+        end_time = time.time()
+        print(f'time for pointcloud generation: {end_time - start_time}')
     # Normalize pointcloud if statistics are available and normalization is enabled
     if need_pointcloud and cfg.normalize_pointcloud:
         pc_np = normalize_pointcloud(pc_np, dataset_statistics)
@@ -1114,16 +1122,16 @@ def run_episode(
                 pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
                 pc_denorm[:, :3] = pc_np[:, :3] * pc_std + pc_mean
             
-            if cfg.visualize_pc_image:
-                save_pointcloud_image(
-                    pc_denorm,
-                    pc_viz_dir / "pointcloud_step_0000.png",
-                    max_points=cfg.pc_viz_max_points,
-                    title=f'Pointcloud Step 0',
-                )
+            # if cfg.visualize_pc_image:
+            #     save_pointcloud_image(
+            #         pc_denorm,
+            #         pc_viz_dir / "pointcloud_step_0000.png",
+            #         max_points=cfg.pc_viz_max_points,
+            #         title=f'Pointcloud Step 0',
+            #     )
             
-            if cfg.save_pc_ply:
-                save_pc_np_as_ply(pc_denorm, pc_viz_dir / "pointcloud_step_0000.ply")
+            # if cfg.save_pc_ply:
+            #     save_pc_np_as_ply(pc_denorm, pc_viz_dir / "pointcloud_step_0000.ply")
     
     # Legacy pc_debug_dir for backward compatibility
     pc_debug_dir = None
@@ -1144,6 +1152,57 @@ def run_episode(
         observation = prepare_observation(obs, resize_size)
 
         if len(action_queue) == 0:
+            # refresh pointcloud and visualize
+            start_time = time.time()
+            if need_pointcloud:
+                # Regenerate pointcloud
+                pc_np, _, _ = pointcloud_from_env(
+                    env,
+                    cube_half=cfg.pointcloud_cube_half,
+                    num_points=cfg.pointcloud_num_points,
+                    include_table=cfg.include_table,
+                    recenter_origin=recenter_origin,
+                    direction_vec=direction_vec,
+                    recenter_points=True,
+                    align_forward_to_neg_x=True,
+                    cube_offset=(0.5, 0.5, 0.5),
+                    cube_offset_m=(0.0, 0.0, 0.0),
+                    direction_offset=0.5,
+                )
+                
+                # Normalize pointcloud if statistics are available and normalization is enabled
+                if cfg.normalize_pointcloud:
+                    pc_np = normalize_pointcloud(pc_np, dataset_statistics)
+                
+                if cfg.use_pointcloud_input:
+                    pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
+                end_time = time.time()
+                print(f'time for pointcloud generation: {end_time - start_time}')
+                # Save visualization at specified frequency
+                if pc_viz_dir is not None and t % cfg.pc_viz_freq == 0:
+                    # Denormalize for visualization
+                    pc_denorm = pc_np.copy()
+                    if cfg.normalize_pointcloud and dataset_statistics and "pointcloud" in dataset_statistics:
+                        pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
+                        pc_std = np.array(dataset_statistics["pointcloud"]["std"])
+                        pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
+                        pc_denorm[:, :3] = pc_np[:, :3] * pc_std + pc_mean
+                    
+                    # if cfg.visualize_pc_image:
+                    #     save_pointcloud_image(
+                    #         pc_denorm,
+                    #         pc_viz_dir / f"pointcloud_step_{t:04d}.png",
+                    #         max_points=cfg.pc_viz_max_points,
+                    #         title=f'Pointcloud Step {t}',
+                    #     )
+                    
+                    # if cfg.save_pc_ply:
+                    #     save_pc_np_as_ply(pc_denorm, pc_viz_dir / f"pointcloud_step_{t:04d}.ply")
+                
+                # Legacy pc_debug for backward compatibility
+                if pc_debug_dir is not None and cfg.save_pc_debug and pc_tensor is not None:
+                    save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
+
             prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
             all_images = [observation["left_image"]]
             if cfg.num_images_in_input > 1:
@@ -1261,55 +1320,6 @@ def run_episode(
             success = True
             break
         t += 1
-
-        # refresh pointcloud and visualize
-        if need_pointcloud:
-            # Regenerate pointcloud
-            pc_np, _, _ = pointcloud_from_env(
-                env,
-                cube_half=cfg.pointcloud_cube_half,
-                num_points=cfg.pointcloud_num_points,
-                include_table=cfg.include_table,
-                recenter_origin=recenter_origin,
-                direction_vec=direction_vec,
-                recenter_points=True,
-                align_forward_to_neg_x=True,
-                cube_offset=(0.5, 0.5, 0.5),
-                cube_offset_m=(0.0, 0.0, 0.0),
-                direction_offset=0.5,
-            )
-            
-            # Normalize pointcloud if statistics are available and normalization is enabled
-            if cfg.normalize_pointcloud:
-                pc_np = normalize_pointcloud(pc_np, dataset_statistics)
-            
-            if cfg.use_pointcloud_input:
-                pc_tensor = torch.from_numpy(pc_np).to(torch.bfloat16).to(device).unsqueeze(0)
-            
-            # Save visualization at specified frequency
-            if pc_viz_dir is not None and t % cfg.pc_viz_freq == 0:
-                # Denormalize for visualization
-                pc_denorm = pc_np.copy()
-                if cfg.normalize_pointcloud and dataset_statistics and "pointcloud" in dataset_statistics:
-                    pc_mean = np.array(dataset_statistics["pointcloud"]["mean"])
-                    pc_std = np.array(dataset_statistics["pointcloud"]["std"])
-                    pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
-                    pc_denorm[:, :3] = pc_np[:, :3] * pc_std + pc_mean
-                
-                if cfg.visualize_pc_image:
-                    save_pointcloud_image(
-                        pc_denorm,
-                        pc_viz_dir / f"pointcloud_step_{t:04d}.png",
-                        max_points=cfg.pc_viz_max_points,
-                        title=f'Pointcloud Step {t}',
-                    )
-                
-                if cfg.save_pc_ply:
-                    save_pc_np_as_ply(pc_denorm, pc_viz_dir / f"pointcloud_step_{t:04d}.ply")
-            
-            # Legacy pc_debug for backward compatibility
-            if pc_debug_dir is not None and cfg.save_pc_debug and pc_tensor is not None:
-                save_pc_tensor_as_ply(pc_tensor, pc_debug_dir / f"pc_step_{t:04d}.ply")
 
     # except Exception as e:
     #     log_message(f"Episode error: {e}", log_file)
@@ -1540,8 +1550,23 @@ def eval_robocasa(cfg: GenerateConfig) -> float:
         tracking_head,
     ) = initialize_model(cfg)
     resize_size = get_image_resize_size(cfg)
-    # Initializing envs
-    env_names = sorted([name for name in SINGLE_STAGE_TASK_DATASETS if name != "NavigateKitchen"])[18:]
+    # Initializing envs - get all tasks first (excluding NavigateKitchen)
+    all_env_names = sorted([name for name in SINGLE_STAGE_TASK_DATASETS if name != "NavigateKitchen"])
+    
+    # Apply task slicing for multi-GPU evaluation
+    if cfg.task_slice_start is not None:
+        if cfg.task_slice_end is not None:
+            env_names = all_env_names[cfg.task_slice_start:cfg.task_slice_end]
+            logger.info(f"Task slice: {cfg.task_slice_start}:{cfg.task_slice_end} ({len(env_names)} tasks)")
+        else:
+            env_names = all_env_names[cfg.task_slice_start:]
+            logger.info(f"Task slice: {cfg.task_slice_start}: ({len(env_names)} tasks)")
+    else:
+        env_names = all_env_names
+        logger.info(f"Using default task range ({len(env_names)} tasks)")
+    
+    logger.info(f"Evaluating on {len(env_names)} tasks: {env_names}")
+    
     total_episodes, total_successes = 0, 0
     per_env_summary = []
     for e_name in env_names:
