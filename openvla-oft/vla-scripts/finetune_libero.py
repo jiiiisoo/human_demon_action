@@ -790,43 +790,59 @@ def _downsample_sequence_points(sequence: np.ndarray, max_points: Optional[int])
 
 
 def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps: int = 5, max_frames: int = 20) -> None:
-    """Save tracking video with aggressive optimizations to minimize rendering time."""
+    """Save tracking video with aggressive optimizations to minimize rendering time.
+
+    Supports both 2D (N, 2) and 3D (N, 3) point sequences.
+    """
     if not _ensure_tracking_viz_deps():
         return
     if points_seq.size == 0:
         return
-    
+
     video_path = Path(video_path)
     print(f"video_path: {video_path}")
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
+    # Determine dimensionality from data
+    tracking_dim = points_seq.shape[-1]  # 2 or 3
+    is_2d = (tracking_dim == 2)
+
     fig = None
     writer = None
     try:
         import time
         start_time = time.time()
-        
+
         # Aggressive size reduction: smaller figure = faster rendering
         # Use size divisible by 16 to avoid ffmpeg warnings
         fig = plt.figure(figsize=(4.8, 4.8), dpi=80)  # Results in 384x384 pixels (divisible by 16)
-        ax = fig.add_subplot(111, projection="3d")
+
+        if is_2d:
+            ax = fig.add_subplot(111)
+        else:
+            ax = fig.add_subplot(111, projection="3d")
         ax.set_axis_off()  # Remove axes for faster rendering
-        
+
         # Use first frame as reference for centering (shows delta movements clearly)
-        first_frame = points_seq[0]  # (num_points, 3)
-        first_frame_center = first_frame.mean(axis=0, keepdims=True)  # (1, 3)
-        
+        first_frame = points_seq[0]  # (num_points, D)
+        first_frame_center = first_frame.mean(axis=0, keepdims=True)  # (1, D)
+
         # Compute max range based on first frame for fixed view
         first_frame_centered = first_frame - first_frame_center
         max_range = np.linalg.norm(first_frame_centered, axis=1).max() + 1e-6
-        
+
         # Add margin to show movement
         max_range *= 1.5
-        
-        ax.set_xlim3d([-max_range, max_range])
-        ax.set_ylim3d([-max_range, max_range])
-        ax.set_zlim3d([-max_range, max_range])
-        
+
+        if is_2d:
+            ax.set_xlim([-max_range, max_range])
+            ax.set_ylim([-max_range, max_range])
+            ax.set_aspect('equal')
+        else:
+            ax.set_xlim3d([-max_range, max_range])
+            ax.set_ylim3d([-max_range, max_range])
+            ax.set_zlim3d([-max_range, max_range])
+
         T = len(points_seq)
         # Aggressively limit number of frames (20 instead of 50)
         if T > max_frames:
@@ -835,23 +851,30 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
             print(f"Limiting frames from {T} to {max_frames} for faster rendering")
         else:
             frame_indices = range(T)
-        
-        scatter = ax.scatter([], [], [], c='blue', marker='o', s=3, alpha=0.5)  # Smaller, more transparent points
+
+        if is_2d:
+            scatter = ax.scatter([], [], c='blue', marker='o', s=3, alpha=0.5)
+        else:
+            scatter = ax.scatter([], [], [], c='blue', marker='o', s=3, alpha=0.5)
         writer = imageio.get_writer(video_path, fps=fps, quality=7)  # Lower quality for faster encoding
-        
+
         for idx, frame_idx in enumerate(frame_indices):
             pts = points_seq[frame_idx]
-            
+
             # Center all frames relative to first frame's center
             # Render all points without downsampling
             pts_centered = pts - first_frame_center
-            ax.view_init(elev=20.0, azim=45.0)
-            scatter._offsets3d = (pts_centered[:, 0], pts_centered[:, 1], pts_centered[:, 2])
-            
+
+            if is_2d:
+                scatter.set_offsets(pts_centered[:, :2])
+            else:
+                ax.view_init(elev=20.0, azim=45.0)
+                scatter._offsets3d = (pts_centered[:, 0], pts_centered[:, 1], pts_centered[:, 2])
+
             fig.canvas.draw()
             frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
             writer.append_data(frame)
-        
+
         writer.close()
         elapsed = time.time() - start_time
         print(f"Successfully saved tracking video to {video_path} (took {elapsed:.2f}s)")
@@ -880,65 +903,84 @@ def _save_input_pointcloud_image(
 ) -> None:
     """
     Save single pointcloud visualization (for sanity check of VLA input).
-    
+
+    Supports both 2D (N, 2) and 3D (N, 3) pointclouds.
+
     Args:
-        pointcloud: Input pointcloud (N, 3)
+        pointcloud: Input pointcloud (N, 2) or (N, 3)
         image_path: Path to save the image
         max_points: Maximum points to render
     """
     if not _ensure_tracking_viz_deps():
         return
-    
+
     if pointcloud.size == 0:
         return
-    
+
     image_path = Path(image_path)
     image_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Downsample if needed
     if max_points and pointcloud.shape[0] > max_points:
         indices = np.linspace(0, pointcloud.shape[0] - 1, max_points, dtype=int)
         pointcloud = pointcloud[indices]
-    
+
+    # Determine dimensionality from data
+    tracking_dim = pointcloud.shape[-1]  # 2 or 3
+    is_2d = (tracking_dim == 2)
+
     fig = None
     try:
         import time
         start_time = time.time()
-        
+
         # Create figure
         fig = plt.figure(figsize=(6.4, 4.8), dpi=80)
-        ax = fig.add_subplot(111, projection="3d")
+        if is_2d:
+            ax = fig.add_subplot(111)
+        else:
+            ax = fig.add_subplot(111, projection="3d")
         ax.set_title('Input Pointcloud (VLA Input)', fontsize=12, pad=10)
         ax.set_axis_off()
-        
+
         # Center pointcloud
         center = pointcloud.mean(axis=0, keepdims=True)
         pc_centered = pointcloud - center
         max_range = np.linalg.norm(pc_centered, axis=1).max() + 1e-6
         max_range *= 1.2  # Add margin
-        
-        # Set view limits
-        ax.set_xlim3d([-max_range, max_range])
-        ax.set_ylim3d([-max_range, max_range])
-        ax.set_zlim3d([-max_range, max_range])
-        
-        # Set view angle
-        ax.view_init(elev=20.0, azim=45.0)
-        
-        # Plot points
-        ax.scatter(
-            pc_centered[:, 0],
-            pc_centered[:, 1],
-            pc_centered[:, 2],
-            c='blue',
-            marker='o',
-            s=3,
-            alpha=0.6
-        )
-        
+
+        if is_2d:
+            # 2D plot
+            ax.set_xlim([-max_range, max_range])
+            ax.set_ylim([-max_range, max_range])
+            ax.set_aspect('equal')
+            ax.scatter(
+                pc_centered[:, 0],
+                pc_centered[:, 1],
+                c='blue',
+                marker='o',
+                s=3,
+                alpha=0.6
+            )
+        else:
+            # 3D plot
+            ax.set_xlim3d([-max_range, max_range])
+            ax.set_ylim3d([-max_range, max_range])
+            ax.set_zlim3d([-max_range, max_range])
+            ax.view_init(elev=20.0, azim=45.0)
+            ax.scatter(
+                pc_centered[:, 0],
+                pc_centered[:, 1],
+                pc_centered[:, 2],
+                c='blue',
+                marker='o',
+                s=3,
+                alpha=0.6
+            )
+
         plt.tight_layout()
         fig.savefig(image_path, dpi=80, bbox_inches='tight')
-        
+
         elapsed = time.time() - start_time
         print(f"Successfully saved input pointcloud to {image_path} (took {elapsed:.2f}s)")
     except Exception as e:
@@ -1719,8 +1761,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Tracking head (낮은 lr!)
     if cfg.use_tracking_head:
         tracking_params = [param for param in tracking_head.parameters() if param.requires_grad]
-        # param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate * 0.1})  # 10배 낮게
-        param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate})
+        param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate * 0.1})  # 10배 낮게
+        # param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate})
 
     # Total params 출력
     total_params = sum(p.numel() for group in param_groups for p in group['params'])
