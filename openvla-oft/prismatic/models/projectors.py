@@ -49,6 +49,76 @@ class PointcloudProjector(nn.Module):
         return projected_features
 
 
+class PointNetProjector(nn.Module):
+    """
+    PointNet-style encoder that projects pointcloud into the LLM's embedding space.
+
+    Unlike the simple PointcloudProjector which flattens the pointcloud,
+    this uses the PointNet architecture:
+    1. Per-point feature extraction via shared MLP
+    2. Global max pooling to aggregate features
+    3. Final projection to LLM embedding space
+
+    This is permutation invariant and scales better with varying point counts.
+    """
+
+    def __init__(
+        self,
+        llm_dim: int,
+        num_points: int,
+        point_dim: int = 3,
+        hidden_dims: tuple = (64, 128, 256),
+    ) -> None:
+        super().__init__()
+        self.llm_dim = llm_dim
+        self.num_points = num_points
+        self.point_dim = point_dim
+
+        # Per-point feature extraction (shared MLP)
+        layers = []
+        in_dim = point_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(in_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.ReLU(inplace=True),
+            ])
+            in_dim = h_dim
+        self.point_mlp = nn.Sequential(*layers)
+
+        # Final projection after global pooling
+        self.global_fc = nn.Sequential(
+            nn.Linear(hidden_dims[-1], llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        )
+
+    def forward(self, pointcloud: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pointcloud: (bsz, num_points, point_dim)
+        Returns:
+            (bsz, llm_dim)
+        """
+        bsz, n_pts, _ = pointcloud.shape
+
+        # Per-point features: (bsz, num_points, point_dim) -> (bsz * num_points, point_dim)
+        x = pointcloud.reshape(bsz * n_pts, -1)
+
+        # Shared MLP with BatchNorm
+        x = self.point_mlp(x)  # (bsz * num_points, hidden_dims[-1])
+
+        # Reshape back: (bsz, num_points, hidden_dims[-1])
+        x = x.reshape(bsz, n_pts, -1)
+
+        # Global max pooling: (bsz, hidden_dims[-1])
+        global_feat = x.max(dim=1)[0]
+
+        # Project to LLM space
+        output = self.global_fc(global_feat)
+        return output
+
+
 class NoisyActionProjector(nn.Module):
     """
     [Diffusion] Projects noisy action inputs into the LLM's embedding space.

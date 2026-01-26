@@ -558,11 +558,13 @@ class LastPointcloudHead(nn.Module):
         )
         
         # Temporal fusion: Fuse T timesteps to 1
-        self.temporal_fusion = nn.Sequential(
-            nn.Linear(NUM_ACTIONS_CHUNK * hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        # MLP-based fusion (original)
+        # self.temporal_fusion = nn.Sequential(
+        #     nn.Linear(NUM_ACTIONS_CHUNK * hidden_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, hidden_dim),
+        # )
+        # Now using mean pooling instead
         
         # Point encoder (same as PointTrackingHeadWithPointInput)
         self.point_mlp = nn.Sequential(
@@ -598,9 +600,12 @@ class LastPointcloudHead(nn.Module):
         ctx = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)  # (B, T, action_dim*hidden_dim)
         ctx_feat = self.ctx_mlp(ctx)  # (B, T, hidden_dim)
         
-        # Fuse temporal dimension: (B, T, hidden_dim) -> (B, T*hidden_dim) -> (B, hidden_dim)
-        ctx_flat = ctx_feat.reshape(batch_size, -1)  # (B, T*hidden_dim)
-        fused_actions = self.temporal_fusion(ctx_flat)  # (B, hidden_dim)
+        # Fuse temporal dimension: (B, T, hidden_dim) -> (B, hidden_dim) via mean pooling
+        fused_actions = ctx_feat.mean(dim=1)  # (B, hidden_dim)
+        
+        # Original MLP-based fusion (commented out)
+        # ctx_flat = ctx_feat.reshape(batch_size, -1)  # (B, T*hidden_dim)
+        # fused_actions = self.temporal_fusion(ctx_flat)  # (B, hidden_dim)
         
         # Encode pointcloud
         point_feat = self.point_mlp(pointcloud)  # (B, N, hidden_dim)

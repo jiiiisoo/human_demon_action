@@ -64,6 +64,7 @@ from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
     NoisyActionProjector,
     PointcloudProjector,
+    PointNetProjector,
     ProprioProjector,
 )
 from prismatic.training.train_utils import (
@@ -130,6 +131,7 @@ class FinetuneConfig:
     use_pointcloud_input: bool = False               # If True, appends a pointcloud token from the initial frame to the VLA input
     pointcloud_input_num_points: int = 0             # Number of points to keep for the pointcloud input token (pad/truncate). 0 => use raw
     pointcloud_input_dim: int = 3                    # Dimensionality of each point for the pointcloud input token
+    pointcloud_encoder_type: str = "mlp"             # Pointcloud encoder type: "mlp" (flatten+MLP) or "pointnet" (PointNet-style)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     use_tracking_head: bool = False                  # If True, predicts tracking targets from action token hidden states
     tracking_dim: int = 0                            # Dimensionality of tracking target per timestep
@@ -565,11 +567,35 @@ def run_forward_pass(
             tracking_l1_loss = torch.nn.L1Loss()(predicted_tracking, tracking_labels)
             weighted_tracking_loss = tracking_loss_weight * tracking_l1_loss
             loss = weighted_tracking_loss if loss is None else loss + weighted_tracking_loss
-            metrics.update(
-                {
-                    "tracking_l1_loss": tracking_l1_loss.item(),
-                }
-            )
+
+            # Debug metrics for tracking head diagnosis
+            with torch.no_grad():
+                pred_mean = predicted_tracking.mean().item()
+                pred_std = predicted_tracking.std().item()
+                gt_mean = tracking_labels.mean().item()
+                gt_std = tracking_labels.std().item()
+                # Per-dimension stats
+                pred_per_dim_std = predicted_tracking.std(dim=(0, 1, 2))  # (tracking_dim,)
+                gt_per_dim_std = tracking_labels.std(dim=(0, 1, 2))  # (tracking_dim,)
+                # Pointcloud input stats (input to tracking head)
+                pc_mean = tracking_pointcloud_for_head.mean().item() if tracking_pointcloud_for_head is not None else 0.0
+                pc_std = tracking_pointcloud_for_head.std().item() if tracking_pointcloud_for_head is not None else 0.0
+
+            debug_metrics = {
+                "tracking_l1_loss": tracking_l1_loss.item(),
+                "tracking_pred_mean": pred_mean,
+                "tracking_pred_std": pred_std,
+                "tracking_gt_mean": gt_mean,
+                "tracking_gt_std": gt_std,
+                "tracking_pc_input_mean": pc_mean,
+                "tracking_pc_input_std": pc_std,
+            }
+            # Add per-dim stats (handle both 2D and 3D)
+            for i in range(len(pred_per_dim_std)):
+                debug_metrics[f"tracking_pred_std_dim{i}"] = pred_per_dim_std[i].item()
+                debug_metrics[f"tracking_gt_std_dim{i}"] = gt_per_dim_std[i].item()
+
+            metrics.update(debug_metrics)
             if capture_tracking:
                 if pointcloud_input is not None and train_dataset is not None:
                     print('denormalize pointcloud and tracking')
@@ -1649,8 +1675,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         assert pointcloud_input_num_points is not None and pointcloud_input_num_points > 0, (
             "pointcloud_input_num_points must be > 0 when using pointcloud input."
         )
+        # Select projector class based on encoder type
+        if cfg.pointcloud_encoder_type == "pointnet":
+            projector_cls = PointNetProjector
+        else:
+            projector_cls = PointcloudProjector
         pointcloud_projector = init_module(
-            PointcloudProjector,
+            projector_cls,
             "pointcloud_projector",
             cfg,
             device_id,
@@ -1798,8 +1829,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Tracking head (낮은 lr!)
     if cfg.use_tracking_head:
         tracking_params = [param for param in tracking_head.parameters() if param.requires_grad]
-        param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate * 0.1})  # 10배 낮게
-        # param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate})
+        # param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate * 0.1})  # 10배 낮게
+        param_groups.append({'params': tracking_params, 'lr': cfg.learning_rate})
 
     # Total params 출력
     total_params = sum(p.numel() for group in param_groups for p in group['params'])
@@ -2009,8 +2040,22 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "tracking_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
                 "curr_tracking_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
                 "next_tracking_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                # Debug metrics for tracking head diagnosis
+                "tracking_pred_mean": deque(maxlen=cfg.grad_accumulation_steps),
+                "tracking_pred_std": deque(maxlen=cfg.grad_accumulation_steps),
+                "tracking_gt_mean": deque(maxlen=cfg.grad_accumulation_steps),
+                "tracking_gt_std": deque(maxlen=cfg.grad_accumulation_steps),
+                "tracking_pc_input_mean": deque(maxlen=cfg.grad_accumulation_steps),
+                "tracking_pc_input_std": deque(maxlen=cfg.grad_accumulation_steps),
+                "tracking_grad_norm": deque(maxlen=cfg.grad_accumulation_steps),
+                "action_grad_norm": deque(maxlen=cfg.grad_accumulation_steps),
+                "vla_grad_norm": deque(maxlen=cfg.grad_accumulation_steps),
             }
         )
+        # Add per-dim stats based on tracking_dim
+        for i in range(cfg.tracking_dim):
+            recent_metrics[f"tracking_pred_std_dim{i}"] = deque(maxlen=cfg.grad_accumulation_steps)
+            recent_metrics[f"tracking_gt_std_dim{i}"] = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Start training
     # Create an infinite dataloader iterator that restarts when exhausted
@@ -2094,6 +2139,51 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Backward pass
             normalized_loss.backward()
+
+            # Compute gradient norms for debugging (before optimizer.step)
+            if cfg.use_tracking_head and tracking_head is not None and (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                # Tracking head gradient norm
+                tracking_grad_norm = 0.0
+                tracking_param_count = 0
+                for p in tracking_head.parameters():
+                    if p.grad is not None:
+                        tracking_grad_norm += p.grad.data.norm(2).item() ** 2
+                        tracking_param_count += 1
+                tracking_grad_norm = tracking_grad_norm ** 0.5 if tracking_param_count > 0 else 0.0
+
+                # Action head gradient norm (for comparison)
+                action_grad_norm = 0.0
+                action_param_count = 0
+                if action_head is not None:
+                    for p in action_head.parameters():
+                        if p.grad is not None:
+                            action_grad_norm += p.grad.data.norm(2).item() ** 2
+                            action_param_count += 1
+                action_grad_norm = action_grad_norm ** 0.5 if action_param_count > 0 else 0.0
+
+                # VLA backbone gradient norm
+                vla_grad_norm = 0.0
+                vla_param_count = 0
+                for p in vla.parameters():
+                    if p.grad is not None:
+                        vla_grad_norm += p.grad.data.norm(2).item() ** 2
+                        vla_param_count += 1
+                vla_grad_norm = vla_grad_norm ** 0.5 if vla_param_count > 0 else 0.0
+
+                metrics["tracking_grad_norm"] = tracking_grad_norm
+                metrics["action_grad_norm"] = action_grad_norm
+                metrics["vla_grad_norm"] = vla_grad_norm
+
+                # Print debug info every 100 steps
+                if log_step % 100 == 0 and distributed_state.is_main_process:
+                    print(f"\n[DEBUG Step {log_step}] Tracking Head Diagnosis:")
+                    print(f"  Pred  - mean: {metrics.get('tracking_pred_mean', 0):.6f}, std: {metrics.get('tracking_pred_std', 0):.6f}")
+                    print(f"  GT    - mean: {metrics.get('tracking_gt_mean', 0):.6f}, std: {metrics.get('tracking_gt_std', 0):.6f}")
+                    print(f"  Pred per-dim std: [{metrics.get('tracking_pred_std_dim0', 0):.6f}, {metrics.get('tracking_pred_std_dim1', 0):.6f}]")
+                    print(f"  GT   per-dim std: [{metrics.get('tracking_gt_std_dim0', 0):.6f}, {metrics.get('tracking_gt_std_dim1', 0):.6f}]")
+                    print(f"  PC input - mean: {metrics.get('tracking_pc_input_mean', 0):.6f}, std: {metrics.get('tracking_pc_input_std', 0):.6f}")
+                    print(f"  Grad norms - tracking: {tracking_grad_norm:.6f}, action: {action_grad_norm:.6f}, vla: {vla_grad_norm:.6f}")
+                    print(f"  Losses - tracking: {metrics.get('tracking_l1_loss', 0):.6f}, action: {metrics.get('curr_action_l1_loss', 0):.6f}")
 
             # Store recent train metrics
             for metric_name, value in metrics.items():
