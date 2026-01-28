@@ -669,9 +669,9 @@ class RoboCasaHdf5Dataset(Dataset):
         # Avoid division by zero
         pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
         
-        # Normalize (only first 3 dimensions if D > 3)
+        stat_dim = len(pc_mean)
         normalized = pointcloud.copy()
-        normalized[:, :3] = (pointcloud[:, :3] - pc_mean) / pc_std
+        normalized[:, :stat_dim] = (pointcloud[:, :stat_dim] - pc_mean) / pc_std
         
         return normalized
     
@@ -695,14 +695,9 @@ class RoboCasaHdf5Dataset(Dataset):
         track_std = np.where(track_std < 1e-6, 1.0, track_std)
         
         # Normalize
-        if len(tracking.shape) == 2:
-            # (num_points, 3)
-            normalized = (tracking - track_mean) / track_std
-        elif len(tracking.shape) == 3:
-            # (T, num_points, 3)
-            normalized = (tracking - track_mean[None, None, :]) / track_std[None, None, :]
-        else:
-            normalized = tracking
+        stat_dim = len(track_mean)
+        normalized = tracking.copy()
+        normalized[:, :, :stat_dim] = (tracking[:, :, :stat_dim] - track_mean) / track_std
         
         return normalized
     
@@ -724,8 +719,9 @@ class RoboCasaHdf5Dataset(Dataset):
 
         pc_std = np.where(pc_std < 1e-6, 1.0, pc_std)
         
+        stat_dim = len(pc_mean)
         denormalized = pointcloud.copy()
-        denormalized[:, :3] = pointcloud[:, :3] * pc_std + pc_mean
+        denormalized[:, :stat_dim] = pointcloud[:, :stat_dim] * pc_std + pc_mean
         
         return denormalized
     
@@ -772,12 +768,9 @@ class RoboCasaHdf5Dataset(Dataset):
 
         track_std = np.where(track_std < 1e-6, 1.0, track_std)
         
-        if len(tracking.shape) == 2:
-            denormalized = tracking * track_std + track_mean
-        elif len(tracking.shape) == 3:
-            denormalized = tracking * track_std[None, None, :] + track_mean[None, None, :]
-        else:
-            denormalized = tracking
+        stat_dim = len(track_mean)
+        denormalized = tracking.copy()
+        denormalized[:, :, :stat_dim] = tracking[:, :, :stat_dim] * track_std + track_mean
         
         return denormalized
     
@@ -949,6 +942,8 @@ class RoboCasaHdf5Dataset(Dataset):
             pc = frame_data["pointcloud"]
             if pc is not None:
                 frame_data["pointcloud"] = self.normalize_pointcloud(pc)
+                # if pc.shape[-1] == 2 :
+                #     frame_data["pointcloud"] = -frame_data["pointcloud"]
             
             tracking = frame_data["tracking"]
             if tracking is not None:
@@ -959,6 +954,8 @@ class RoboCasaHdf5Dataset(Dataset):
                 else:
                     # For tracking deltas, use tracking statistics
                     frame_data["tracking"] = self.normalize_tracking(tracking)
+                    # if tracking.shape[-1] == 2 :
+                    #     frame_data["tracking"] = -frame_data["tracking"]
         
         # Apply batch transform (converts to tensors)
         transformed = self.batch_transform(frame_data)

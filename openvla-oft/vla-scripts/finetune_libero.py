@@ -121,6 +121,7 @@ class FinetuneConfig:
     tracking_tracks_root: Optional[Path] = None      # Root directory for tracking data (pointcloud + tracking deltas)
     tracking_tracks_filename: str = "vertex_tracks_face_uniform.npy"  # Track filename under each episode dir
     precomputed_statistics_path: Optional[Path] = None  # Path to precomputed statistics JSON file
+    use_lerobot_tracking_naming: bool = False        # If True, uses file-XXX naming (demo_1->file-000) for tracking files
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -826,10 +827,25 @@ def _downsample_sequence_points(sequence: np.ndarray, max_points: Optional[int])
     return sequence[:, :max_points]
 
 
-def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps: int = 5, max_frames: int = 20) -> None:
+def _save_tracking_sequence_video(
+    points_seq: np.ndarray,
+    video_path: Path,
+    fps: int = 5,
+    max_frames: int = 20,
+    use_camera_coords: bool = False,
+) -> None:
     """Save tracking video with aggressive optimizations to minimize rendering time.
 
     Supports both 2D (N, 2) and 3D (N, 3) point sequences.
+
+    Args:
+        points_seq: Point sequence array (T, N, D)
+        video_path: Path to save the video
+        fps: Frames per second
+        max_frames: Maximum frames to render
+        use_camera_coords: If True (for OMY F3M), use camera coordinate transform
+                          (Y-flip, top-down view elev=90, azim=0).
+                          If False (default), use original settings (elev=20, azim=45).
     """
     if not _ensure_tracking_viz_deps():
         return
@@ -850,9 +866,8 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
         import time
         start_time = time.time()
 
-        # Aggressive size reduction: smaller figure = faster rendering
-        # Use size divisible by 16 to avoid ffmpeg warnings
-        fig = plt.figure(figsize=(4.8, 4.8), dpi=80)  # Results in 384x384 pixels (divisible by 16)
+        # Larger figure for better visibility
+        fig = plt.figure(figsize=(6.4, 6.4), dpi=100)  # Results in 640x640 pixels
 
         if is_2d:
             ax = fig.add_subplot(111)
@@ -860,8 +875,17 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
             ax = fig.add_subplot(111, projection="3d")
         ax.set_axis_off()  # Remove axes for faster rendering
 
+        # For 3D with camera coords (OMY F3M): transform camera coords to visualization coords
+        # Camera: X=right, Y=down, Z=forward
+        # Visualization: X=right, Y=up, Z=forward (flip Y)
+        if not is_2d and use_camera_coords:
+            points_seq_viz = points_seq.copy()
+            points_seq_viz[:, :, 1] = -points_seq_viz[:, :, 1]  # Flip Y axis
+        else:
+            points_seq_viz = points_seq
+
         # Use first frame as reference for centering (shows delta movements clearly)
-        first_frame = points_seq[0]  # (num_points, D)
+        first_frame = points_seq_viz[0]  # (num_points, D)
         first_frame_center = first_frame.mean(axis=0, keepdims=True)  # (1, D)
 
         # Compute max range based on first frame for fixed view
@@ -879,8 +903,15 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
             ax.set_xlim3d([-max_range, max_range])
             ax.set_ylim3d([-max_range, max_range])
             ax.set_zlim3d([-max_range, max_range])
+            # Set view angle based on coordinate system
+            if use_camera_coords:
+                # OMY F3M: top-down view for camera coordinates
+                ax.view_init(elev=90.0, azim=0.0)
+            else:
+                # Original: diagonal view
+                ax.view_init(elev=20.0, azim=45.0)
 
-        T = len(points_seq)
+        T = len(points_seq_viz)
         # Aggressively limit number of frames (20 instead of 50)
         if T > max_frames:
             # Sample evenly across the sequence
@@ -890,13 +921,13 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
             frame_indices = range(T)
 
         if is_2d:
-            scatter = ax.scatter([], [], c='blue', marker='o', s=3, alpha=0.5)
+            scatter = ax.scatter([], [], c='blue', marker='o', s=5, alpha=0.6)
         else:
-            scatter = ax.scatter([], [], [], c='blue', marker='o', s=3, alpha=0.5)
+            scatter = ax.scatter([], [], [], c='blue', marker='o', s=5, alpha=0.6)
         writer = imageio.get_writer(video_path, fps=fps, quality=7)  # Lower quality for faster encoding
 
         for idx, frame_idx in enumerate(frame_indices):
-            pts = points_seq[frame_idx]
+            pts = points_seq_viz[frame_idx]
 
             # Center all frames relative to first frame's center
             # Render all points without downsampling
@@ -905,7 +936,7 @@ def _save_tracking_sequence_video(points_seq: np.ndarray, video_path: Path, fps:
             if is_2d:
                 scatter.set_offsets(pts_centered[:, :2])
             else:
-                ax.view_init(elev=20.0, azim=45.0)
+                # Keep the same view angle for all frames (set once above)
                 scatter._offsets3d = (pts_centered[:, 0], pts_centered[:, 1], pts_centered[:, 2])
 
             fig.canvas.draw()
@@ -937,6 +968,7 @@ def _save_input_pointcloud_image(
     pointcloud: np.ndarray,
     image_path: Path,
     max_points: Optional[int] = None,
+    use_camera_coords: bool = False,
 ) -> None:
     """
     Save single pointcloud visualization (for sanity check of VLA input).
@@ -947,6 +979,9 @@ def _save_input_pointcloud_image(
         pointcloud: Input pointcloud (N, 2) or (N, 3)
         image_path: Path to save the image
         max_points: Maximum points to render
+        use_camera_coords: If True (for OMY F3M), use camera coordinate transform
+                          (Y-flip, top-down view elev=90, azim=0).
+                          If False (default), use original settings (elev=20, azim=45).
     """
     if not _ensure_tracking_viz_deps():
         return
@@ -966,18 +1001,25 @@ def _save_input_pointcloud_image(
     tracking_dim = pointcloud.shape[-1]  # 2 or 3
     is_2d = (tracking_dim == 2)
 
+    # For 3D with camera coords (OMY F3M): transform camera coords to visualization coords
+    # Camera: X=right, Y=down, Z=forward
+    # Visualization: X=right, Y=up, Z=forward (flip Y)
+    if not is_2d and use_camera_coords:
+        pointcloud = pointcloud.copy()
+        pointcloud[:, 1] = -pointcloud[:, 1]  # Flip Y axis
+
     fig = None
     try:
         import time
         start_time = time.time()
 
-        # Create figure
-        fig = plt.figure(figsize=(6.4, 4.8), dpi=80)
+        # Create larger figure for better visibility
+        fig = plt.figure(figsize=(8.0, 8.0), dpi=100)
         if is_2d:
             ax = fig.add_subplot(111)
         else:
             ax = fig.add_subplot(111, projection="3d")
-        ax.set_title('Input Pointcloud (VLA Input)', fontsize=12, pad=10)
+        ax.set_title('Input Pointcloud (VLA Input)', fontsize=14, pad=10)
         ax.set_axis_off()
 
         # Center pointcloud
@@ -996,7 +1038,7 @@ def _save_input_pointcloud_image(
                 pc_centered[:, 1],
                 c='blue',
                 marker='o',
-                s=3,
+                s=5,
                 alpha=0.6
             )
         else:
@@ -1004,14 +1046,20 @@ def _save_input_pointcloud_image(
             ax.set_xlim3d([-max_range, max_range])
             ax.set_ylim3d([-max_range, max_range])
             ax.set_zlim3d([-max_range, max_range])
-            ax.view_init(elev=20.0, azim=45.0)
+            # Set view angle based on coordinate system
+            if use_camera_coords:
+                # OMY F3M: top-down view for camera coordinates
+                ax.view_init(elev=90.0, azim=0.0)
+            else:
+                # Original: diagonal view
+                ax.view_init(elev=20.0, azim=45.0)
             ax.scatter(
                 pc_centered[:, 0],
                 pc_centered[:, 1],
                 pc_centered[:, 2],
                 c='blue',
                 marker='o',
-                s=3,
+                s=5,
                 alpha=0.6
             )
 
@@ -1039,10 +1087,11 @@ def save_tracking_visualizations(
     tracking_labels_are_deltas: bool,
     max_points: Optional[int],
     pointcloud_input_only: bool = False,
+    use_camera_coords: bool = False,
 ) -> None:
     """
     Save tracking visualizations or pointcloud input visualization.
-    
+
     Args:
         tracking_debug: Dict with predicted_tracking, tracking_labels, pointcloud_input
         output_dir: Directory to save visualizations
@@ -1050,14 +1099,16 @@ def save_tracking_visualizations(
         tracking_labels_are_deltas: Whether labels are deltas (for tracking mode)
         max_points: Max points to render
         pointcloud_input_only: If True, saves only input pointcloud (no tracking)
+        use_camera_coords: If True (for OMY F3M), use camera coordinate transform
+                          (Y-flip, top-down view). If False (default), use original settings.
     """
     if not _ensure_tracking_viz_deps():
         return
-    
+
     try:
         output_dir = Path(output_dir)
         base_pc = tracking_debug.get("pointcloud_input")
-        
+
         if pointcloud_input_only:
             # Pointcloud input only mode: Save input pointcloud for sanity check
             if base_pc is None:
@@ -1067,6 +1118,7 @@ def save_tracking_visualizations(
                 base_np,
                 output_dir / f"input_pointcloud_step_{log_step:06d}.png",
                 max_points=max_points,
+                use_camera_coords=use_camera_coords,
             )
         else:
             # Tracking mode: Save tracking videos
@@ -1081,9 +1133,17 @@ def save_tracking_visualizations(
             gt_seq = _build_tracking_sequence(base_np, gt_np, treat_as_delta=tracking_labels_are_deltas)
             pred_seq = _downsample_sequence_points(pred_seq, max_points)
             gt_seq = _downsample_sequence_points(gt_seq, max_points)
-            _save_tracking_sequence_video(pred_seq, output_dir / f"tracking_pred_step_{log_step:06d}.mp4")
-            _save_tracking_sequence_video(gt_seq, output_dir / f"tracking_gt_step_{log_step:06d}.mp4")
-        
+            _save_tracking_sequence_video(
+                pred_seq,
+                output_dir / f"tracking_pred_step_{log_step:06d}.mp4",
+                use_camera_coords=use_camera_coords,
+            )
+            _save_tracking_sequence_video(
+                gt_seq,
+                output_dir / f"tracking_gt_step_{log_step:06d}.mp4",
+                use_camera_coords=use_camera_coords,
+            )
+
         # Clean up matplotlib resources after visualization
         _cleanup_matplotlib_resources()
     except Exception as e:
@@ -1952,6 +2012,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalize_tracking=cfg.normalize_tracking,
             precomputed_statistics_path=cfg.precomputed_statistics_path,
             filename=cfg.tracking_tracks_filename,
+            use_lerobot_tracking_naming=cfg.use_lerobot_tracking_naming,
         )
     else:
         # LIBERO dataset loading (default)
@@ -2217,6 +2278,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     tracking_labels_are_deltas=cfg.tracking_tracks_root is not None,
                     max_points=cfg.tracking_viz_max_points,
                     pointcloud_input_only=pointcloud_input_only,
+                    use_camera_coords=(cfg.dataset_type == "omy_f3m"),
                 )
                 print(f"[Main Process] Completed visualization save at step {log_step}")
             
