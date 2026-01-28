@@ -228,6 +228,8 @@ class RoboCasaHdf5Dataset(Dataset):
         precomputed_statistics_path: Optional[Path] = None,
         filename: str = "vertex_tracks_face_uniform.npy",
         use_last_pointcloud_target: bool = False,  # If True, returns final pointcloud instead of tracking deltas
+        ablation_dataset: bool = False,  # If True, pad/truncate points to ablation_mean_points
+        ablation_mean_points: Optional[int] = None,  # Target number of points for ablation mode
     ) -> None:
         """
         Args:
@@ -266,6 +268,13 @@ class RoboCasaHdf5Dataset(Dataset):
         self.precomputed_statistics_path = Path(precomputed_statistics_path) if precomputed_statistics_path else None
         self.filename = filename
         self.use_last_pointcloud_target = use_last_pointcloud_target
+        self.ablation_dataset = ablation_dataset
+        self.ablation_mean_points = ablation_mean_points
+
+        if self.ablation_dataset:
+            assert self.ablation_mean_points is not None and self.ablation_mean_points > 0, (
+                "ablation_mean_points must be provided and > 0 when ablation_dataset=True"
+            )
 
         # Find all HDF5 files in the directory (recursive search for RoboCasa structure)
         # Pattern: data_dir/*/*/*/*.hdf5 (e.g., kitchen_coffee/CoffeePressButton/2024-04-25/*.hdf5)
@@ -280,7 +289,9 @@ class RoboCasaHdf5Dataset(Dataset):
         print(f"  Num images in input: {num_images_in_input}")
         print(f"  Action chunk size: {action_chunk_size}")
         print(f"  Window stride: {window_stride}")
-        
+        if self.ablation_dataset:
+            print(f"  [Ablation Mode] Padding/truncating points to {self.ablation_mean_points}")
+
         # Build index of all episodes
         self._build_episode_index()
         
@@ -773,7 +784,55 @@ class RoboCasaHdf5Dataset(Dataset):
         denormalized[:, :, :stat_dim] = tracking[:, :, :stat_dim] * track_std + track_mean
         
         return denormalized
-    
+
+    def _pad_or_truncate_points(self, points: np.ndarray) -> np.ndarray:
+        """
+        Pad or truncate points to match ablation_mean_points.
+
+        Args:
+            points: np.ndarray of shape (N, D) or (T, N, D)
+                where N is number of points, D is dimension (usually 3)
+
+        Returns:
+            Padded/truncated array with N = self.ablation_mean_points
+        """
+        if not self.ablation_dataset or self.ablation_mean_points is None:
+            return points
+
+        target_n = self.ablation_mean_points
+
+        if points.ndim == 2:
+            # Shape: (N, D)
+            N, D = points.shape
+            if N > target_n:
+                # Truncate: take first target_n points
+                return points[:target_n]
+            elif N < target_n:
+                # Pad with zeros
+                pad_shape = (target_n - N, D)
+                padding = np.zeros(pad_shape, dtype=points.dtype)
+                return np.concatenate([points, padding], axis=0)
+            else:
+                return points
+
+        elif points.ndim == 3:
+            # Shape: (T, N, D)
+            T, N, D = points.shape
+            if N > target_n:
+                # Truncate: take first target_n points
+                return points[:, :target_n, :]
+            elif N < target_n:
+                # Pad with zeros
+                pad_shape = (T, target_n - N, D)
+                padding = np.zeros(pad_shape, dtype=points.dtype)
+                return np.concatenate([points, padding], axis=1)
+            else:
+                return points
+
+        else:
+            # Unexpected shape, return as-is
+            return points
+
     def _load_frame(self, hdf5_file, demo_grp, frame_idx: int, ep_info: Dict) -> Dict[str, Any]:
         """
         Load a single frame from HDF5 and format it to match RoboCasa format.
@@ -854,6 +913,10 @@ class RoboCasaHdf5Dataset(Dataset):
             track_file = self.tracking_tracks_root / ep_info["tracking_subpath"] / ep_info["demo_name"] / self.filename
             if track_file.exists():
                 tracks = np.load(track_file)  # (T, num_points, 3)
+
+                # Apply ablation padding/truncation if enabled
+                if self.ablation_dataset:
+                    tracks = self._pad_or_truncate_points(tracks)
 
                 if load_pointcloud:
                     # Initial pointcloud (for both VLA input and tracking head)
@@ -989,6 +1052,8 @@ def make_robocasa_hdf5_datasets(
     precomputed_statistics_path: Optional[Path] = None,
     filename: str = "vertex_tracks_face_uniform.npy",
     use_last_pointcloud_target: bool = False,
+    ablation_dataset: bool = False,
+    ablation_mean_points: Optional[int] = None,
 ) -> Tuple[RoboCasaHdf5Dataset, Optional[RoboCasaHdf5Dataset]]:
     """
     Create train and (optionally) validation datasets from RoboCasa HDF5 files.
@@ -1010,6 +1075,8 @@ def make_robocasa_hdf5_datasets(
         normalize_tracking: Whether to normalize tracking data (x, y, z separately)
         precomputed_statistics_path: Path to precomputed statistics JSON (recommended for large datasets)
         use_last_pointcloud_target: If True, returns final pointcloud as target instead of tracking deltas
+        ablation_dataset: If True, pad/truncate points to ablation_mean_points
+        ablation_mean_points: Target number of points for ablation mode
 
     Returns:
         (train_dataset, val_dataset) where val_dataset is None if use_val_set=False
@@ -1032,6 +1099,8 @@ def make_robocasa_hdf5_datasets(
         precomputed_statistics_path=precomputed_statistics_path,
         filename=filename,
         use_last_pointcloud_target=use_last_pointcloud_target,
+        ablation_dataset=ablation_dataset,
+        ablation_mean_points=ablation_mean_points,
     )
 
     val_dataset = None
@@ -1054,6 +1123,8 @@ def make_robocasa_hdf5_datasets(
             precomputed_statistics_path=precomputed_statistics_path,
             filename=filename,
             use_last_pointcloud_target=use_last_pointcloud_target,
+            ablation_dataset=ablation_dataset,
+            ablation_mean_points=ablation_mean_points,
         )
 
     return train_dataset, val_dataset

@@ -152,6 +152,10 @@ class FinetuneConfig:
     normalize_pointcloud: bool = True                # If True, normalize pointcloud input (x, y, z separately)
     normalize_tracking: bool = True                  # If True, normalize tracking data (x, y, z separately)
 
+    # Ablation dataset settings
+    ablation_dataset: bool = False                   # If True, pad/truncate points to mean for variable-point datasets
+    ablation_mean_points_path: Optional[Path] = None # Path to JSON file with precomputed mean point count
+
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
     learning_rate: float = 5e-4                      # Learning rate
@@ -1946,6 +1950,20 @@ def finetune(cfg: FinetuneConfig) -> None:
         # num_images_in_input: 1=left only, 3=left+right+wrist
         print(f"\n[Dataset] Loading RoboCasa dataset from {cfg.robocasa_data_dir}")
 
+        # Load ablation mean points if ablation mode is enabled
+        ablation_mean_points = None
+        if cfg.ablation_dataset:
+            assert cfg.ablation_mean_points_path is not None, (
+                "ablation_mean_points_path is required when ablation_dataset=True"
+            )
+            assert Path(cfg.ablation_mean_points_path).exists(), (
+                f"ablation_mean_points_path not found: {cfg.ablation_mean_points_path}"
+            )
+            with open(cfg.ablation_mean_points_path, "r") as f:
+                ablation_stats = json.load(f)
+            ablation_mean_points = ablation_stats["mean_points"]
+            print(f"  [Ablation Mode] Using mean_points={ablation_mean_points} for padding/truncation")
+
         # Create batch transform for RoboCasa
         batch_transform = RoboCasaBatchTransform(
             action_tokenizer,
@@ -1976,6 +1994,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalize_tracking=cfg.normalize_tracking,
             precomputed_statistics_path=cfg.precomputed_statistics_path,
             filename=cfg.tracking_tracks_filename,
+            ablation_dataset=cfg.ablation_dataset,
+            ablation_mean_points=ablation_mean_points,
         )
     elif cfg.dataset_type == "omy_f3m":
         # OMY F3M dataset loading (real-world robot data converted from LeRobot v3.0)
